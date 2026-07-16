@@ -169,30 +169,44 @@ class Hub:
             dialog = self.store.dialog(account["id"], peer.id)
             if message.outgoing and not dialog:
                 return
-            topic_id = dialog["topic_id"] if dialog else await self.ensure_topic(account, peer.id, peer_name)
+            if not dialog:
+                await self.import_dialog(client, account, peer.id, peer_name)
+                return
+            topic_id = dialog["topic_id"]
             await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
         except Exception:
-            log.exception("Could not route incoming message")
+            log.exception("Could not route message")
 
-    async def import_recent_dialogs(self, client: Client, account):
-        """One-time import: 50 latest private chats, 20 recent messages each."""
+    async def import_dialog(self, client: Client, account, peer_id: int, peer_name: str, history=None):
+        """Create a topic only after a real client reply, then copy its recent context."""
+        if self.store.dialog(account["id"], peer_id): return False
+        history = history if history is not None else [m async for m in client.get_chat_history(peer_id, limit=20)]
+        if not any(not message.outgoing for message in history): return False
+        topic_id = await self.ensure_topic(account, peer_id, peer_name)
+        for message in reversed(history):
+            await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
+            await asyncio.sleep(0.08)
+        return True
+
+    async def import_recent_replied_dialogs(self, client: Client, account):
+        """Import up to 50 recent private chats where the other person has replied."""
         imported = 0
-        async for dialog in client.get_dialogs(limit=50):
+        checked = 0
+        async for dialog in client.get_dialogs(limit=250):
+            if imported >= 50: break
             chat = dialog.chat
             if chat.type != ChatType.PRIVATE or self.store.dialog(account["id"], chat.id):
                 continue
+            checked += 1
             peer_name = " ".join(filter(None, [chat.first_name, chat.last_name])) or chat.username or str(chat.id)
             try:
-                topic_id = await self.ensure_topic(account, chat.id, peer_name)
                 history = [message async for message in client.get_chat_history(chat.id, limit=20)]
-                for message in reversed(history):
-                    await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
-                    await asyncio.sleep(0.08)
-                imported += 1
-                await asyncio.sleep(0.2)
+                if await self.import_dialog(client, account, chat.id, peer_name, history):
+                    imported += 1
+                    await asyncio.sleep(0.2)
             except Exception:
                 log.exception("Could not import dialog for %s", client.dialoghub_session)
-        log.info("Imported %s recent dialogs for %s", imported, client.dialoghub_session)
+        log.info("Checked %s chats and imported %s replied dialogs for %s", checked, imported, client.dialoghub_session)
 
     async def start_account(self, session_name: str):
         if session_name in self.clients: return
@@ -203,7 +217,7 @@ class Hub:
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         await client.start(); self.clients[session_name] = client
         log.info("Account started: %s", session_name)
-        await self.import_recent_dialogs(client, account)
+        await self.import_recent_replied_dialogs(client, account)
 
     @staticmethod
     def keyboard(rows):
@@ -230,7 +244,7 @@ class Hub:
                 await self.bot.send(message["chat"]["id"], "⚠️ Сессия не найдена. Введите имя файла ещё раз.")
                 return True
             self.store.add_account(session, project_id, session); self.store.clear_state(user_id)
-            await self.bot.send(message["chat"]["id"], "✅ Аккаунт добавлен. Импортирую последние 50 диалогов…")
+            await self.bot.send(message["chat"]["id"], "✅ Аккаунт добавлен. Импортирую до 50 диалогов, где клиент уже ответил…")
             asyncio.create_task(self.start_account(session))
             await self.accounts_menu(message["chat"]["id"])
             return True
