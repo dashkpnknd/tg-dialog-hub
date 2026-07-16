@@ -126,21 +126,24 @@ class Hub:
         self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}
 
     def allowed(self, user_id: int) -> bool:
-        return not self.s.admins or user_id in self.s.admins
+        stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
+        allowed = stored or self.s.admins
+        return not allowed or user_id in allowed
 
     async def ensure_topic(self, account, peer_id: int, peer_name: str) -> int:
         existing = self.store.dialog(account["id"], peer_id)
         if existing: return existing["topic_id"]
         chat_id = self.store.get("hub_chat_id")
         if not chat_id: raise RuntimeError("CRM group not configured: send /setup in the forum group")
-        label = f"{peer_name} · {account['project_id'] or 'Без проекта'}"
+        project = self.store.db.execute("SELECT name FROM projects WHERE id=?", (account["project_id"],)).fetchone()
+        label = f"{peer_name} · {project['name'] if project else 'Без проекта'}"
         topic = await self.bot.topic(int(chat_id), label)
         self.store.add_dialog(account["id"], peer_id, topic["message_thread_id"], peer_name)
         return topic["message_thread_id"]
 
     async def incoming(self, client: Client, message):
         if message.chat.type not in (ChatType.PRIVATE,): return
-        account = self.store.account(client.name)
+        account = self.store.account(client.dialoghub_session)
         if not account or message.from_user is None: return
         peer_name = " ".join(filter(None, [message.from_user.first_name, message.from_user.last_name])) or str(message.from_user.id)
         try:
@@ -178,6 +181,8 @@ class Hub:
         if command == "/setup":
             if not self.allowed(user_id) or chat.get("type") not in ("supergroup", "group"):
                 return True
+            if not self.store.get("admin_ids") and not self.s.admins:
+                self.store.set("admin_ids", str(user_id))
             self.store.set("hub_chat_id", str(chat["id"])); await self.bot.send(chat["id"], "✅ DialogHub подключён к этому чату.")
         elif command == "/project" and self.allowed(user_id):
             if parts: self.store.add_project(" ".join(parts)); await self.bot.send(chat["id"], "✅ Проект добавлен.")
@@ -212,6 +217,7 @@ class Hub:
         for account in self.store.accounts():
             name = account["session_name"]
             client = Client(str(self.s.sessions_dir / name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=False)
+            client.dialoghub_session = name
             client.add_handler(MessageHandler(self.incoming, filters.incoming & filters.private))
             await client.start(); self.clients[name] = client; log.info("Account started: %s", name)
         try: await self.poll()
