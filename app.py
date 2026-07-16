@@ -178,7 +178,9 @@ class Hub:
         if not message or not (text := message.get("text", "")).startswith("/"): return False
         sender = message.get("from", {}); chat = message.get("chat", {}); user_id = sender.get("id", 0)
         command, *parts = text.split(maxsplit=2); command = command.split("@", 1)[0]
-        if command == "/setup":
+        if command == "/start":
+            await self.bot.send(chat["id"], "<b>DialogHub</b> — единый центр диалогов.\n\nВ CRM-группе отправьте /setup.\n\nКоманды администратора:\n/project Название проекта\n/account Проект имя_сессии\n/status\n/help")
+        elif command == "/setup":
             if not self.allowed(user_id) or chat.get("type") not in ("supergroup", "group"):
                 return True
             if not self.store.get("admin_ids") and not self.s.admins:
