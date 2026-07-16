@@ -59,6 +59,8 @@ class Store:
           account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
           peer_name TEXT, PRIMARY KEY(account_id, peer_id), UNIQUE(topic_id),
           FOREIGN KEY(account_id) REFERENCES accounts(id));
+        CREATE TABLE IF NOT EXISTS user_states (
+          user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT);
         """)
         self.db.commit()
 
@@ -99,6 +101,15 @@ class Store:
     def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str):
         self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name) VALUES(?,?,?,?)", (account_id, peer_id, topic_id, peer_name)); self.db.commit()
 
+    def state(self, user_id: int):
+        return self.db.execute("SELECT * FROM user_states WHERE user_id=?", (user_id,)).fetchone()
+
+    def set_state(self, user_id: int, action: str, payload: str = ""):
+        self.db.execute("INSERT INTO user_states(user_id,action,payload) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET action=excluded.action,payload=excluded.payload", (user_id, action, payload)); self.db.commit()
+
+    def clear_state(self, user_id: int):
+        self.db.execute("DELETE FROM user_states WHERE user_id=?", (user_id,)); self.db.commit()
+
 
 class BotAPI:
     def __init__(self, token: str):
@@ -113,10 +124,12 @@ class BotAPI:
         if not data.get("ok"):
             raise RuntimeError(data.get("description", "Telegram API error"))
         return data["result"]
-    async def send(self, chat_id: int, text: str, topic_id: int | None = None):
+    async def send(self, chat_id: int, text: str, topic_id: int | None = None, markup: dict | None = None):
         body = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if topic_id: body["message_thread_id"] = topic_id
+        if markup: body["reply_markup"] = markup
         return await self.call("sendMessage", **body)
+    async def answer(self, callback_id: str): return await self.call("answerCallbackQuery", callback_query_id=callback_id)
     async def topic(self, chat_id: int, title: str):
         return await self.call("createForumTopic", chat_id=chat_id, name=title[:128])
 
@@ -155,9 +168,75 @@ class Hub:
         except Exception:
             log.exception("Could not route incoming message")
 
+    @staticmethod
+    def keyboard(rows):
+        return {"inline_keyboard": [[{"text": text, "callback_data": data} for text, data in row] for row in rows]}
+
+    async def main_menu(self, chat_id: int):
+        await self.bot.send(chat_id, "<b>DialogHub</b>\nВыберите раздел:", markup=self.keyboard([
+            [("📁 Проекты", "menu:projects"), ("👤 Аккаунты", "menu:accounts")],
+            [("📊 Статус", "menu:status"), ("ℹ️ Помощь", "menu:help")],
+        ]))
+
+    async def handle_state_input(self, message: dict) -> bool:
+        sender = message.get("from", {}); user_id = sender.get("id", 0)
+        state = self.store.state(user_id); text = (message.get("text") or "").strip()
+        if not state or not text or text.startswith("/") or not self.allowed(user_id): return False
+        if state["action"] == "new_project":
+            self.store.add_project(text[:80]); self.store.clear_state(user_id)
+            await self.bot.send(message["chat"]["id"], f"✅ Проект «{html.escape(text[:80])}» добавлен.")
+            await self.projects_menu(message["chat"]["id"])
+            return True
+        if state["action"] == "new_account":
+            project_id = int(state["payload"]); session = text.removesuffix(".session").strip()
+            if not (self.s.sessions_dir / f"{session}.session").exists():
+                await self.bot.send(message["chat"]["id"], "⚠️ Сессия не найдена. Введите имя файла ещё раз.")
+                return True
+            self.store.add_account(session, project_id, session); self.store.clear_state(user_id)
+            await self.bot.send(message["chat"]["id"], "✅ Аккаунт добавлен. Перезапускаю подключение…")
+            await self.accounts_menu(message["chat"]["id"])
+            return True
+        return False
+
+    async def projects_menu(self, chat_id: int):
+        projects = self.store.projects()
+        text = "<b>Проекты</b>\n" + ("\n".join(f"• {html.escape(p['name'])}" for p in projects) if projects else "Пока нет проектов.")
+        await self.bot.send(chat_id, text, markup=self.keyboard([[("➕ Добавить проект", "project:add")], [("⬅️ Назад", "menu:main")]]))
+
+    async def accounts_menu(self, chat_id: int):
+        accounts = self.store.accounts()
+        text = "<b>Аккаунты</b>\n" + ("\n".join(f"• {html.escape(a['title'] or a['session_name'])} — {html.escape(a['project_name'] or 'Без проекта')}" for a in accounts) if accounts else "Пока нет подключённых аккаунтов.")
+        await self.bot.send(chat_id, text, markup=self.keyboard([[("➕ Добавить аккаунт", "account:add")], [("⬅️ Назад", "menu:main")]]))
+
+    async def callback(self, update: dict):
+        query = update.get("callback_query")
+        if not query: return False
+        await self.bot.answer(query["id"])
+        user_id = query.get("from", {}).get("id", 0); chat_id = query.get("message", {}).get("chat", {}).get("id")
+        if not chat_id: return True
+        data = query.get("data", "")
+        if data == "menu:main": await self.main_menu(chat_id)
+        elif data == "menu:projects": await self.projects_menu(chat_id)
+        elif data == "menu:accounts": await self.accounts_menu(chat_id)
+        elif data == "menu:status":
+            await self.bot.send(chat_id, f"<b>Статус</b>\nПроектов: {len(self.store.projects())}\nПодключённых аккаунтов: {len(self.store.accounts())}")
+        elif data == "menu:help":
+            await self.bot.send(chat_id, "<b>Как начать</b>\n1. В CRM-группе: /setup\n2. В меню создайте проект\n3. Добавьте аккаунт в проект")
+        elif data == "project:add" and self.allowed(user_id):
+            self.store.set_state(user_id, "new_project"); await self.bot.send(chat_id, "Введите название нового проекта:")
+        elif data == "account:add" and self.allowed(user_id):
+            projects = self.store.projects()
+            if not projects: await self.bot.send(chat_id, "Сначала создайте хотя бы один проект.")
+            else: await self.bot.send(chat_id, "Выберите проект:", markup=self.keyboard([[(p["name"], f"account:project:{p['id']}")] for p in projects] + [[("⬅️ Назад", "menu:accounts")]]))
+        elif data.startswith("account:project:") and self.allowed(user_id):
+            self.store.set_state(user_id, "new_account", data.rsplit(":", 1)[1]); await self.bot.send(chat_id, "Введите имя файла сессии без <code>.session</code>.")
+        return True
+
     async def reply(self, update: dict):
         message = update.get("message") or update.get("edited_message")
-        if not message or message.get("chat", {}).get("id") != int(self.store.get("hub_chat_id") or 0): return
+        if not message: return
+        if await self.handle_state_input(message): return
+        if message.get("chat", {}).get("id") != int(self.store.get("hub_chat_id") or 0): return
         sender = message.get("from", {})
         if sender.get("is_bot") or not self.allowed(sender.get("id", 0)): return
         text = message.get("text") or message.get("caption")
@@ -179,7 +258,7 @@ class Hub:
         sender = message.get("from", {}); chat = message.get("chat", {}); user_id = sender.get("id", 0)
         command, *parts = text.split(maxsplit=2); command = command.split("@", 1)[0]
         if command == "/start":
-            await self.bot.send(chat["id"], "<b>DialogHub</b> — единый центр диалогов.\n\nВ CRM-группе отправьте /setup.\n\nКоманды администратора:\n/project Название проекта\n/account Проект имя_сессии\n/status\n/help")
+            await self.main_menu(chat["id"])
         elif command == "/setup":
             if not self.allowed(user_id) or chat.get("type") not in ("supergroup", "group"):
                 return True
@@ -206,9 +285,10 @@ class Hub:
         offset = None
         while True:
             try:
-                updates = await self.bot.call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "edited_message"])
+                updates = await self.bot.call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "edited_message", "callback_query"])
                 for update in updates:
                     offset = update["update_id"] + 1
+                    if await self.callback(update): continue
                     if not await self.command(update): await self.reply(update)
             except asyncio.CancelledError: raise
             except Exception:
