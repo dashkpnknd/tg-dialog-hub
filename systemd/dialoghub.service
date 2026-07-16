@@ -1,0 +1,13 @@
+[Unit]
+Description=DialogHub Telegram CRM
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/dialoghub
+EnvironmentFile=/opt/dialoghub/.env
+ExecStart=/opt/dialoghub/venv/bin/python /opt/dialoghub/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
