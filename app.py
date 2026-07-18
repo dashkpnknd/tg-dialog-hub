@@ -238,7 +238,8 @@ class Hub:
     async def complete_login(self, chat_id: int, user_id: int, client: Client, project_id: int, session_name: str):
         me = await client.get_me()
         title = " ".join(filter(None, [me.first_name, me.last_name])) or str(me.id)
-        if client.is_connected: await client.disconnect()
+        if getattr(client, "is_initialized", False): await client.stop()
+        elif client.is_connected: await client.disconnect()
         self.pending_auth.pop(user_id, None); self.store.clear_state(user_id)
         self.store.add_account(session_name, project_id, title)
         await self.bot.send(chat_id, f"✅ Аккаунт «{html.escape(title)}» подключён. Импортирую диалоги с ответами клиентов…")
@@ -305,6 +306,7 @@ class Hub:
         await self.bot.photo(chat_id, path, caption)
 
     async def wait_qr_login(self, chat_id: int, user_id: int, client: Client, result, event: asyncio.Event, image_path: Path):
+        keep_client = False
         try:
             await self.show_qr(chat_id, result.token, image_path)
             deadline = time.monotonic() + 120
@@ -323,12 +325,22 @@ class Hub:
                     await self.finish_qr_authorization(client, result)
                     data = self.pending_auth[user_id]; await self.complete_login(chat_id, user_id, client, data["project_id"], data["session_name"]); return
             await self.bot.send(chat_id, "⌛ QR-код истёк. Выберите QR-код или вход по номеру заново.")
+        except SessionPasswordNeeded:
+            # QR was accepted, but this account has Telegram two-step verification.
+            # Keep the authenticated temporary client alive for check_password().
+            keep_client = True
+            self.store.set_state(user_id, "auth_password")
+            await self.bot.send(chat_id, "Введите пароль двухфакторной защиты подключаемого аккаунта:")
         except Exception:
             log.exception("QR login failed"); await self.bot.send(chat_id, "⚠️ Не удалось завершить QR-вход. Попробуйте вход по номеру.")
         finally:
             self.pending_qr.pop(user_id, None)
-            data = self.pending_auth.pop(user_id, None)
-            if data and client.is_connected: await client.disconnect()
+            data = self.pending_auth.get(user_id)
+            if not keep_client:
+                self.pending_auth.pop(user_id, None)
+                if data:
+                    if getattr(client, "is_initialized", False): await client.stop()
+                    elif client.is_connected: await client.disconnect()
             image_path.unlink(missing_ok=True)
 
     @staticmethod
