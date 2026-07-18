@@ -263,7 +263,7 @@ class BotAPI:
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock(); self.archived_peers = {}; self.last_poll_activity = time.monotonic()
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.import_tasks = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock(); self.archived_peers = {}; self.last_poll_activity = time.monotonic()
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -428,6 +428,15 @@ class Hub:
                 log.exception("Could not import dialog for %s", client.dialoghub_session)
         log.info("Checked %s chats and imported %s replied dialogs for %s", checked, imported, client.dialoghub_session)
 
+    async def import_account_in_background(self, client: Client, account):
+        """History import must never hold up the management bot interface."""
+        try:
+            await self.import_recent_replied_dialogs(client, account)
+        except Exception:
+            log.exception("Background history import failed for %s", client.dialoghub_session)
+        finally:
+            self.import_tasks.pop(client.dialoghub_session, None)
+
     async def start_account(self, session_name: str):
         if session_name in self.clients: return
         account = self.store.account(session_name)
@@ -449,7 +458,9 @@ class Hub:
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         await client.initialize(); self.clients[session_name] = client
         log.info("Account started: %s", session_name)
-        await self.import_recent_replied_dialogs(client, account)
+        task = self.import_tasks.get(session_name)
+        if not task or task.done():
+            self.import_tasks[session_name] = asyncio.create_task(self.import_account_in_background(client, account))
 
     async def cleanup_stale_account(self, account, reason: str):
         log.warning("Removing stale account %s: %s", account["session_name"], reason)
