@@ -357,23 +357,32 @@ class Hub:
         if not account: return
         session_path = self.s.sessions_dir / f"{session_name}.session"
         if not session_path.exists():
-            log.warning("Removing stale account %s: its session file is missing", session_name)
-            hub_chat_id = int(self.store.get("hub_chat_id") or 0)
-            for dialog in self.store.dialogs_for_account(account["id"]):
-                try:
-                    if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
-                    self.store.delete_dialog(account["id"], dialog["peer_id"])
-                    await asyncio.sleep(1)
-                except Exception: log.exception("Could not clean stale account topic %s", dialog["topic_id"])
-            self.store.delete_account(account["id"])
+            await self.cleanup_stale_account(account, "session file is missing")
             return
         client = Client(str(self.s.sessions_dir / session_name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=False)
         client.dialoghub_session = session_name
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
-        await client.start(); self.clients[session_name] = client
+        authorized = await client.connect()
+        if not authorized:
+            await client.disconnect()
+            session_path.unlink(missing_ok=True); (self.s.sessions_dir / f"{session_name}.session-journal").unlink(missing_ok=True)
+            await self.cleanup_stale_account(account, "session is not authorized")
+            return
+        await client.initialize(); self.clients[session_name] = client
         log.info("Account started: %s", session_name)
         await self.remove_archived_topics(client, account)
         await self.import_recent_replied_dialogs(client, account)
+
+    async def cleanup_stale_account(self, account, reason: str):
+        log.warning("Removing stale account %s: %s", account["session_name"], reason)
+        hub_chat_id = int(self.store.get("hub_chat_id") or 0)
+        for dialog in self.store.dialogs_for_account(account["id"]):
+            try:
+                if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                self.store.delete_dialog(account["id"], dialog["peer_id"])
+                await asyncio.sleep(1)
+            except Exception: log.exception("Could not clean stale account topic %s", dialog["topic_id"])
+        self.store.delete_account(account["id"])
 
     def new_login_client(self, user_id: int):
         name = f"dialoghub_{user_id}_{int(time.time())}"
