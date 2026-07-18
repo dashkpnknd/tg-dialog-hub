@@ -13,8 +13,9 @@ import aiohttp
 from dotenv import load_dotenv
 import qrcode
 from pyrogram import Client, filters, raw
+from pyrogram.errors import SessionPasswordNeeded
 from pyrogram.enums import ChatType
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, RawUpdateHandler
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -147,7 +148,7 @@ class BotAPI:
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -230,48 +231,104 @@ class Hub:
         log.info("Account started: %s", session_name)
         await self.import_recent_replied_dialogs(client, account)
 
-    async def begin_qr_login(self, chat_id: int, user_id: int, project_id: int):
-        if user_id in self.pending_qr:
-            await self.bot.send(chat_id, "QR уже отправлен. Отсканируйте его в Telegram или подождите две минуты.")
-            return
-        session_name = f"dialoghub_{user_id}_{int(time.time())}"
-        client = Client(session_name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir), no_updates=True)
+    def new_login_client(self, user_id: int):
+        name = f"dialoghub_{user_id}_{int(time.time())}"
+        return name, Client(name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir), no_updates=True)
+
+    async def complete_login(self, chat_id: int, user_id: int, client: Client, project_id: int, session_name: str):
+        me = await client.get_me()
+        title = " ".join(filter(None, [me.first_name, me.last_name])) or str(me.id)
+        if client.is_connected: await client.disconnect()
+        self.pending_auth.pop(user_id, None); self.store.clear_state(user_id)
+        self.store.add_account(session_name, project_id, title)
+        await self.bot.send(chat_id, f"✅ Аккаунт «{html.escape(title)}» подключён. Импортирую диалоги с ответами клиентов…")
+        await self.start_account(session_name)
+
+    async def switch_qr_dc(self, client: Client, dc_id: int):
+        if getattr(client, "is_initialized", False): await client.stop()
+        elif client.is_connected: await client.disconnect()
+        await client.storage.dc_id(dc_id); await client.storage.auth_key(None); await client.connect()
+
+    async def export_qr_token(self, client: Client):
+        result = await client.invoke(raw.functions.auth.ExportLoginToken(api_id=self.s.api_id, api_hash=self.s.api_hash, except_ids=[]))
+        if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+            await self.switch_qr_dc(client, result.dc_id)
+            result = await client.invoke(raw.functions.auth.ImportLoginToken(token=result.token))
+        return result
+
+    async def finish_qr_authorization(self, client: Client, result):
+        user = result.authorization.user
+        await client.storage.user_id(user.id); await client.storage.is_bot(False)
+        try: await client.invoke(raw.functions.updates.GetState())
+        except Exception: log.debug("Could not get Telegram state after QR authorization", exc_info=True)
+
+    async def begin_phone_login(self, chat_id: int, user_id: int, project_id: int):
+        if user_id in self.pending_auth:
+            await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+        session_name, client = self.new_login_client(user_id)
         try:
-            await client.connect()
-            token = await client.invoke(raw.functions.auth.ExportLoginToken(api_id=self.s.api_id, api_hash=self.s.api_hash, except_ids=[]))
-            if not isinstance(token, raw.types.auth.LoginToken):
-                raise RuntimeError("Не удалось создать QR-код. Попробуйте ещё раз.")
-            encoded = base64.urlsafe_b64encode(token.token).decode().rstrip("=")
-            image_path = self.s.db_path.parent / f"qr_{user_id}.png"
-            qrcode.make(f"tg://login?token={encoded}").save(image_path)
-            await self.bot.photo(chat_id, image_path, "Откройте Telegram на подключаемом аккаунте: Настройки → Устройства → Подключить устройство. Отсканируйте QR. Код действует около 2 минут.")
-            task = asyncio.create_task(self.wait_qr_login(chat_id, user_id, project_id, session_name, client, token.token, image_path))
+            await asyncio.wait_for(client.connect(), timeout=45)
+            self.pending_auth[user_id] = {"client": client, "project_id": project_id, "session_name": session_name}
+            self.store.set_state(user_id, "auth_phone")
+            await self.bot.send(chat_id, "Введите номер телефона в формате <code>+79991234567</code>.")
+        except Exception:
+            if client.is_connected: await client.disconnect()
+            log.exception("Phone login connection failed")
+            await self.bot.send(chat_id, "⚠️ Не удалось подключиться к Telegram. Попробуйте QR-код или повторите позже.")
+
+    async def begin_qr_login(self, chat_id: int, user_id: int, project_id: int):
+        if user_id in self.pending_auth:
+            await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+        session_name, client = self.new_login_client(user_id)
+        image_path = self.s.db_path.parent / f"qr_{user_id}.png"
+        event = asyncio.Event()
+        async def on_raw_update(_, update, __, ___):
+            if isinstance(update, raw.types.UpdateLoginToken): event.set()
+        try:
+            await asyncio.wait_for(client.connect(), timeout=45)
+            result = await self.export_qr_token(client)
+            if not isinstance(result, raw.types.auth.LoginToken): raise RuntimeError("Unexpected QR login response")
+            client.add_handler(RawUpdateHandler(on_raw_update))
+            await client.initialize()
+            self.pending_auth[user_id] = {"client": client, "project_id": project_id, "session_name": session_name}
+            task = asyncio.create_task(self.wait_qr_login(chat_id, user_id, client, result, event, image_path))
             self.pending_qr[user_id] = task
         except Exception:
             if client.is_connected: await client.disconnect()
             log.exception("Could not start QR login")
-            await self.bot.send(chat_id, "⚠️ Не удалось создать QR-код. Попробуйте ещё раз.")
+            await self.bot.send(chat_id, "⚠️ Не удалось создать QR-код. Выберите вход по номеру или попробуйте снова.")
 
-    async def wait_qr_login(self, chat_id: int, user_id: int, project_id: int, session_name: str, client: Client, token: bytes, image_path: Path):
+    async def show_qr(self, chat_id: int, token: bytes, path: Path, refreshed: bool = False):
+        encoded = base64.urlsafe_b64encode(token).decode().rstrip("=")
+        qrcode.make(f"tg://login?token={encoded}").save(path)
+        caption = "QR-код обновлён. Отсканируйте его в Telegram." if refreshed else "Откройте Telegram на подключаемом аккаунте: Настройки → Устройства → Подключить устройство. Отсканируйте QR."
+        await self.bot.photo(chat_id, path, caption)
+
+    async def wait_qr_login(self, chat_id: int, user_id: int, client: Client, result, event: asyncio.Event, image_path: Path):
         try:
-            for _ in range(60):
-                await asyncio.sleep(2)
-                result = await client.invoke(raw.functions.auth.ImportLoginToken(token=token))
+            await self.show_qr(chat_id, result.token, image_path)
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                expires = result.expires - int(time.time())
+                if expires <= 5:
+                    result = await self.export_qr_token(client)
+                    if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                        await self.finish_qr_authorization(client, result)
+                        data = self.pending_auth[user_id]; await self.complete_login(chat_id, user_id, client, data["project_id"], data["session_name"]); return
+                    if isinstance(result, raw.types.auth.LoginToken): await self.show_qr(chat_id, result.token, image_path, True)
+                try: await asyncio.wait_for(event.wait(), timeout=min(5, max(1, expires)))
+                except asyncio.TimeoutError: continue
+                event.clear(); result = await self.export_qr_token(client)
                 if isinstance(result, raw.types.auth.LoginTokenSuccess):
-                    user = result.authorization.user
-                    title = " ".join(filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])) or str(user.id)
-                    await client.disconnect()
-                    self.store.add_account(session_name, project_id, title)
-                    await self.bot.send(chat_id, f"✅ Аккаунт «{html.escape(title)}» подключён. Импортирую диалоги с ответами клиентов…")
-                    await self.start_account(session_name)
-                    return
-            await self.bot.send(chat_id, "⌛ QR-код истёк. Нажмите «Добавить аккаунт» и попробуйте снова.")
+                    await self.finish_qr_authorization(client, result)
+                    data = self.pending_auth[user_id]; await self.complete_login(chat_id, user_id, client, data["project_id"], data["session_name"]); return
+            await self.bot.send(chat_id, "⌛ QR-код истёк. Выберите QR-код или вход по номеру заново.")
         except Exception:
-            log.exception("QR login failed")
-            await self.bot.send(chat_id, "⚠️ Не удалось завершить вход. Попробуйте создать новый QR-код.")
+            log.exception("QR login failed"); await self.bot.send(chat_id, "⚠️ Не удалось завершить QR-вход. Попробуйте вход по номеру.")
         finally:
             self.pending_qr.pop(user_id, None)
-            if client.is_connected: await client.disconnect()
+            data = self.pending_auth.pop(user_id, None)
+            if data and client.is_connected: await client.disconnect()
             image_path.unlink(missing_ok=True)
 
     @staticmethod
@@ -302,6 +359,39 @@ class Hub:
             await self.bot.send(message["chat"]["id"], "✅ Аккаунт добавлен. Импортирую до 50 диалогов, где клиент уже ответил…")
             asyncio.create_task(self.start_account(session))
             await self.accounts_menu(message["chat"]["id"])
+            return True
+        auth = self.pending_auth.get(user_id)
+        if state["action"] == "auth_phone":
+            if not auth:
+                self.store.clear_state(user_id); await self.bot.send(message["chat"]["id"], "Сессия входа истекла. Начните заново."); return True
+            phone = text.replace(" ", "").replace("-", "")
+            if not phone.startswith("+"): phone = "+" + phone
+            try:
+                sent = await asyncio.wait_for(auth["client"].send_code(phone), timeout=45)
+                auth["phone"] = phone; auth["phone_hash"] = sent.phone_code_hash; self.store.set_state(user_id, "auth_code")
+                await self.bot.send(message["chat"]["id"], "Код отправлен в Telegram. Введите код:")
+            except Exception:
+                log.exception("Could not send login code"); await self.bot.send(message["chat"]["id"], "⚠️ Не удалось отправить код. Проверьте номер и попробуйте ещё раз.")
+            return True
+        if state["action"] == "auth_code":
+            if not auth:
+                self.store.clear_state(user_id); await self.bot.send(message["chat"]["id"], "Сессия входа истекла. Начните заново."); return True
+            try:
+                await asyncio.wait_for(auth["client"].sign_in(auth["phone"], auth["phone_hash"], text.replace(" ", "")), timeout=45)
+                await self.complete_login(message["chat"]["id"], user_id, auth["client"], auth["project_id"], auth["session_name"])
+            except SessionPasswordNeeded:
+                self.store.set_state(user_id, "auth_password"); await self.bot.send(message["chat"]["id"], "Введите пароль двухфакторной защиты:")
+            except Exception:
+                log.exception("Could not sign in by code"); await self.bot.send(message["chat"]["id"], "⚠️ Код не подошёл. Введите код ещё раз.")
+            return True
+        if state["action"] == "auth_password":
+            if not auth:
+                self.store.clear_state(user_id); await self.bot.send(message["chat"]["id"], "Сессия входа истекла. Начните заново."); return True
+            try:
+                await asyncio.wait_for(auth["client"].check_password(text), timeout=45)
+                await self.complete_login(message["chat"]["id"], user_id, auth["client"], auth["project_id"], auth["session_name"])
+            except Exception:
+                log.exception("Could not validate 2FA password"); await self.bot.send(message["chat"]["id"], "⚠️ Пароль не подошёл. Введите его ещё раз.")
             return True
         return False
 
@@ -339,11 +429,14 @@ class Hub:
             project_id = data.rsplit(":", 1)[1]
             await self.bot.send(chat_id, "Выберите способ подключения:", markup=self.keyboard([
                 [("📷 Войти по QR-коду", f"account:qr:{project_id}")],
+                [("📱 Войти по номеру", f"account:phone:{project_id}")],
                 [("📁 Подключить готовую session", f"account:session:{project_id}")],
                 [("⬅️ Назад", "account:add")],
             ]))
         elif data.startswith("account:qr:") and self.allowed(user_id):
             await self.begin_qr_login(chat_id, user_id, int(data.rsplit(":", 1)[1]))
+        elif data.startswith("account:phone:") and self.allowed(user_id):
+            await self.begin_phone_login(chat_id, user_id, int(data.rsplit(":", 1)[1]))
         elif data.startswith("account:session:") and self.allowed(user_id):
             self.store.set_state(user_id, "new_account", data.rsplit(":", 1)[1]); await self.bot.send(chat_id, "Введите имя файла сессии без <code>.session</code>.")
         return True
