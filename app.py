@@ -63,7 +63,7 @@ class Store:
           FOREIGN KEY(project_id) REFERENCES projects(id));
         CREATE TABLE IF NOT EXISTS dialogs (
           account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
-          peer_name TEXT, PRIMARY KEY(account_id, peer_id), UNIQUE(topic_id),
+          peer_name TEXT, imported INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id, peer_id), UNIQUE(topic_id),
           FOREIGN KEY(account_id) REFERENCES accounts(id));
         CREATE TABLE IF NOT EXISTS user_states (
           user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT);
@@ -71,6 +71,9 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
         if "color" not in columns:
             self.db.execute("ALTER TABLE projects ADD COLUMN color INTEGER")
+        dialog_columns = {row[1] for row in self.db.execute("PRAGMA table_info(dialogs)")}
+        if "imported" not in dialog_columns:
+            self.db.execute("ALTER TABLE dialogs ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
         for project in self.db.execute("SELECT id FROM projects WHERE color IS NULL").fetchall():
             self.db.execute("UPDATE projects SET color=? WHERE id=?", (PROJECT_COLORS[(project["id"] - 1) % len(PROJECT_COLORS)], project["id"]))
         self.db.commit()
@@ -115,6 +118,9 @@ class Store:
     def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str):
         self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name) VALUES(?,?,?,?)", (account_id, peer_id, topic_id, peer_name)); self.db.commit()
 
+    def mark_imported(self, account_id: int, peer_id: int):
+        self.db.execute("UPDATE dialogs SET imported=1 WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
+
     def state(self, user_id: int):
         return self.db.execute("SELECT * FROM user_states WHERE user_id=?", (user_id,)).fetchone()
 
@@ -129,11 +135,14 @@ class BotAPI:
     def __init__(self, token: str):
         self.base = f"https://api.telegram.org/bot{token}"
         self.http: Optional[aiohttp.ClientSession] = None
+        self.topic_lock = asyncio.Lock()
+        self.last_topic_created_at = 0.0
+        self.topic_interval_seconds = 25
 
     async def start(self): self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     async def close(self): await self.http.close()
     async def call(self, method: str, **payload):
-        for _ in range(5):
+        while True:
             async with self.http.post(f"{self.base}/{method}", json=payload) as response:
                 data = await response.json()
             if data.get("ok"): return data["result"]
@@ -146,7 +155,6 @@ class BotAPI:
                 await asyncio.sleep(retry_after + 1)
                 continue
             raise RuntimeError(data.get("description", "Telegram API error"))
-        raise RuntimeError(f"Telegram rate limit did not clear for {method}")
     async def send(self, chat_id: int, text: str, topic_id: int | None = None, markup: dict | None = None):
         body = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if topic_id: body["message_thread_id"] = topic_id
@@ -164,7 +172,12 @@ class BotAPI:
     async def topic(self, chat_id: int, title: str, color: int | None = None):
         body = {"chat_id": chat_id, "name": title[:128]}
         if color is not None: body["icon_color"] = color
-        return await self.call("createForumTopic", **body)
+        async with self.topic_lock:
+            wait = self.topic_interval_seconds - (time.monotonic() - self.last_topic_created_at)
+            if wait > 0: await asyncio.sleep(wait)
+            result = await self.call("createForumTopic", **body)
+            self.last_topic_created_at = time.monotonic()
+            return result
 
 
 class Hub:
@@ -212,13 +225,15 @@ class Hub:
 
     async def import_dialog(self, client: Client, account, peer_id: int, peer_name: str, history=None):
         """Create a topic only after a real client reply, then copy its recent context."""
-        if self.store.dialog(account["id"], peer_id): return False
+        existing = self.store.dialog(account["id"], peer_id)
+        if existing and existing["imported"]: return False
         history = history if history is not None else [m async for m in client.get_chat_history(peer_id, limit=20)]
         if not any(not message.outgoing for message in history): return False
-        topic_id = await self.ensure_topic(account, peer_id, peer_name)
+        topic_id = existing["topic_id"] if existing else await self.ensure_topic(account, peer_id, peer_name)
         for message in reversed(history):
             await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(1.0)
+        self.store.mark_imported(account["id"], peer_id)
         return True
 
     async def import_recent_replied_dialogs(self, client: Client, account):
@@ -228,7 +243,8 @@ class Hub:
         async for dialog in client.get_dialogs(limit=250):
             if imported >= 50: break
             chat = dialog.chat
-            if chat.type != ChatType.PRIVATE or self.store.dialog(account["id"], chat.id):
+            existing = self.store.dialog(account["id"], chat.id)
+            if chat.type != ChatType.PRIVATE or (existing and existing["imported"]):
                 continue
             checked += 1
             peer_name = " ".join(filter(None, [chat.first_name, chat.last_name])) or chat.username or str(chat.id)
@@ -236,7 +252,7 @@ class Hub:
                 history = [message async for message in client.get_chat_history(chat.id, limit=20)]
                 if await self.import_dialog(client, account, chat.id, peer_name, history):
                     imported += 1
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(2.0)
             except Exception:
                 log.exception("Could not import dialog for %s", client.dialoghub_session)
         log.info("Checked %s chats and imported %s replied dialogs for %s", checked, imported, client.dialoghub_session)
