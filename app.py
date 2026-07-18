@@ -330,7 +330,9 @@ class Hub:
                 if current >= limit: return
 
     async def remove_archived_topics(self, client: Client, account):
-        archived_ids = {dialog.chat.id async for dialog in self.folder_dialogs(client, 1, 500) if dialog.chat.type == ChatType.PRIVATE}
+        archived_ids = self.archived_peers.get(client.dialoghub_session)
+        if archived_ids is None:
+            archived_ids = {dialog.chat.id async for dialog in self.folder_dialogs(client, 1, 500) if dialog.chat.type == ChatType.PRIVATE}
         self.archived_peers[client.dialoghub_session] = archived_ids
         if not archived_ids: return
         chat_id = int(self.store.get("hub_chat_id") or 0)
@@ -344,6 +346,18 @@ class Hub:
             except Exception:
                 log.exception("Could not delete archived CRM topic")
         if removed: log.info("Removed %s archived CRM topics for %s", removed, client.dialoghub_session)
+
+    async def load_archived_peer_ids(self, client: Client):
+        """Read archive before handlers are registered, so old updates cannot create topics."""
+        result = await client.invoke(raw.functions.messages.GetDialogs(
+            offset_date=0, offset_id=0, offset_peer=raw.types.InputPeerEmpty(),
+            limit=100, hash=0, folder_id=1,
+        ), sleep_threshold=60)
+        return {
+            dialog.peer.user_id
+            for dialog in result.dialogs
+            if isinstance(dialog, raw.types.Dialog) and isinstance(dialog.peer, raw.types.PeerUser)
+        }
 
     async def delete_account_from_hub(self, chat_id: int, account_id: int):
         account = self.store.account_by_id(account_id)
@@ -417,16 +431,17 @@ class Hub:
             return
         client = Client(str(self.s.sessions_dir / session_name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=False)
         client.dialoghub_session = session_name
-        client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         authorized = await client.connect()
         if not authorized:
             await client.disconnect()
             session_path.unlink(missing_ok=True); (self.s.sessions_dir / f"{session_name}.session-journal").unlink(missing_ok=True)
             await self.cleanup_stale_account(account, "session is not authorized")
             return
+        self.archived_peers[session_name] = await self.load_archived_peer_ids(client)
+        await self.remove_archived_topics(client, account)
+        client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         await client.initialize(); self.clients[session_name] = client
         log.info("Account started: %s", session_name)
-        await self.remove_archived_topics(client, account)
         await self.import_recent_replied_dialogs(client, account)
 
     async def cleanup_stale_account(self, account, reason: str):
