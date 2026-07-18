@@ -191,6 +191,8 @@ class BotAPI:
             data = await response.json()
         if not data.get("ok"): raise RuntimeError(data.get("description", "Telegram API error"))
         return data["result"]
+    async def edit(self, chat_id: int, message_id: int, text: str):
+        return await self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML")
     async def topic(self, chat_id: int, title: str, color: int | None = None):
         body = {"chat_id": chat_id, "name": title[:128]}
         if color is not None: body["icon_color"] = color
@@ -292,20 +294,29 @@ class Hub:
         account = self.store.account_by_id(account_id)
         if not account:
             await self.bot.send(chat_id, "Этот аккаунт уже удалён."); return
+        dialogs = self.store.dialogs_for_account(account_id)
+        status = await self.bot.send(chat_id, f"🗑 Начинаю удаление аккаунта «{html.escape(account['title'] or account['session_name'])}».\nТем к удалению: {len(dialogs)}")
         client = self.clients.pop(account["session_name"], None)
         if client:
             try: await client.stop()
             except Exception: log.exception("Could not stop account client before deletion")
         hub_chat_id = int(self.store.get("hub_chat_id") or 0)
-        for dialog in self.store.dialogs_for_account(account_id):
+        deleted = 0; failed = 0
+        for dialog in dialogs:
             try:
                 if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                self.store.delete_dialog(account_id, dialog["peer_id"]); deleted += 1
+                await self.bot.edit(chat_id, status["message_id"], f"🗑 Удаляю аккаунт «{html.escape(account['title'] or account['session_name'])}».\nУдалено тем: {deleted} из {len(dialogs)}")
                 await asyncio.sleep(1)
-            except Exception: log.exception("Could not delete account topic %s", dialog["topic_id"])
+            except Exception:
+                failed += 1; log.exception("Could not delete account topic %s", dialog["topic_id"])
         for suffix in (".session", ".session-journal"):
             (self.s.sessions_dir / f"{account['session_name']}{suffix}").unlink(missing_ok=True)
         self.store.delete_account(account_id)
-        await self.bot.send(chat_id, "✅ Аккаунт, его сессия и все связанные темы удалены.")
+        result = "✅ Удаление завершено.\nАккаунт исчез из списка, сессия удалена."
+        if failed: result += f"\n⚠️ Не удалось удалить тем: {failed}. Они будут удалены при следующем запуске очистки."
+        else: result += f"\nУдалено тем: {deleted}."
+        await self.bot.edit(chat_id, status["message_id"], result)
 
     async def import_dialog(self, client: Client, account, peer_id: int, peer_name: str, history=None):
         """Create a topic only after a real client reply, then copy its recent context."""
