@@ -491,6 +491,8 @@ class Hub:
                 if old_project_hub: await self.bot.delete_topic(old_project_hub, old_report)
             except Exception:
                 log.exception("Could not delete old report topic for %s", project["name"])
+        # Create the report first so the project is immediately visible in its new forum.
+        await self.ensure_report_topic(project)
         for dialog in self.store.dialogs_for_project(project_id):
             old_chat_id = dialog["hub_chat_id"]
             if old_chat_id == target_chat_id: continue
@@ -511,7 +513,18 @@ class Hub:
                 if old_chat_id: await self.bot.delete_topic(old_chat_id, dialog["topic_id"])
             except Exception:
                 log.exception("Could not move CRM topic for project %s", project["name"])
-        await self.ensure_report_topic(project)
+
+    async def resume_project_moves(self):
+        """Continue any move interrupted by permissions, a restart, or a rate limit."""
+        await asyncio.sleep(8)
+        for project in self.store.projects():
+            target_chat_id = self.store.project_hub(project["id"])
+            if target_chat_id and any(dialog["hub_chat_id"] != target_chat_id for dialog in self.store.dialogs_for_project(project["id"])):
+                log.info("Resuming move for project %s", project["name"])
+                try:
+                    await self.move_project_to_hub(project["id"], target_chat_id)
+                except Exception:
+                    log.exception("Could not resume move for project %s", project["name"])
 
     async def start_account(self, session_name: str):
         if session_name in self.clients: return
@@ -987,6 +1000,7 @@ class Hub:
         await self.bot.start()
         report_task = asyncio.create_task(self.report_loop())
         watchdog_task = asyncio.create_task(self.poll_watchdog())
+        move_task = asyncio.create_task(self.resume_project_moves())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
@@ -994,6 +1008,7 @@ class Hub:
         finally:
             report_task.cancel()
             watchdog_task.cancel()
+            move_task.cancel()
             for client in self.clients.values(): await client.stop()
             await self.bot.close()
 
