@@ -62,14 +62,15 @@ class Store:
         self.db.executescript("""
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, color INTEGER);
+        CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, color INTEGER, hub_chat_id INTEGER);
+        CREATE TABLE IF NOT EXISTS hubs (chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY, session_name TEXT UNIQUE NOT NULL, project_id INTEGER,
           title TEXT, enabled INTEGER NOT NULL DEFAULT 1,
           FOREIGN KEY(project_id) REFERENCES projects(id));
         CREATE TABLE IF NOT EXISTS dialogs (
           account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
-          peer_name TEXT, imported INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id, peer_id), UNIQUE(topic_id),
+          peer_name TEXT, imported INTEGER NOT NULL DEFAULT 0, hub_chat_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id, peer_id), UNIQUE(hub_chat_id, topic_id),
           FOREIGN KEY(account_id) REFERENCES accounts(id));
         CREATE TABLE IF NOT EXISTS user_states (
           user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT);
@@ -88,9 +89,27 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
         if "color" not in columns:
             self.db.execute("ALTER TABLE projects ADD COLUMN color INTEGER")
+        if "hub_chat_id" not in columns:
+            self.db.execute("ALTER TABLE projects ADD COLUMN hub_chat_id INTEGER")
         dialog_columns = {row[1] for row in self.db.execute("PRAGMA table_info(dialogs)")}
+        if "hub_chat_id" not in dialog_columns:
+            default_hub = int(self.get("hub_chat_id") or 0)
+            self.db.executescript("""
+            CREATE TABLE dialogs_v2 (
+              account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+              peer_name TEXT, imported INTEGER NOT NULL DEFAULT 0, hub_chat_id INTEGER NOT NULL,
+              PRIMARY KEY(account_id, peer_id), UNIQUE(hub_chat_id, topic_id),
+              FOREIGN KEY(account_id) REFERENCES accounts(id));
+            """)
+            self.db.execute("INSERT INTO dialogs_v2(account_id,peer_id,topic_id,peer_name,imported,hub_chat_id) SELECT account_id,peer_id,topic_id,peer_name,imported,? FROM dialogs", (default_hub,))
+            self.db.execute("DROP TABLE dialogs")
+            self.db.execute("ALTER TABLE dialogs_v2 RENAME TO dialogs")
         if "imported" not in dialog_columns:
             self.db.execute("ALTER TABLE dialogs ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
+        default_hub = int(self.get("hub_chat_id") or 0)
+        if default_hub:
+            self.db.execute("INSERT OR IGNORE INTO hubs(chat_id,title) VALUES(?,?)", (default_hub, "Основная CRM"))
+            self.db.execute("UPDATE projects SET hub_chat_id=? WHERE hub_chat_id IS NULL", (default_hub,))
         for project in self.db.execute("SELECT id FROM projects WHERE color IS NULL").fetchall():
             self.db.execute("UPDATE projects SET color=? WHERE id=?", (PROJECT_COLORS[(project["id"] - 1) % len(PROJECT_COLORS)], project["id"]))
         self.db.commit()
@@ -108,6 +127,19 @@ class Store:
         row = self.db.execute("SELECT id, color FROM projects WHERE name=?", (name,)).fetchone()
         if row and row["color"] is None:
             self.db.execute("UPDATE projects SET color=? WHERE id=?", (PROJECT_COLORS[(row["id"] - 1) % len(PROJECT_COLORS)], row["id"])); self.db.commit()
+
+    def register_hub(self, chat_id: int, title: str):
+        self.db.execute("INSERT INTO hubs(chat_id,title) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title", (chat_id, title)); self.db.commit()
+
+    def hubs(self):
+        return self.db.execute("SELECT * FROM hubs ORDER BY title").fetchall()
+
+    def bind_project_hub(self, project_id: int, chat_id: int):
+        self.db.execute("UPDATE projects SET hub_chat_id=? WHERE id=?", (chat_id, project_id)); self.db.commit()
+
+    def project_hub(self, project_id: int) -> int:
+        row = self.db.execute("SELECT hub_chat_id FROM projects WHERE id=?", (project_id,)).fetchone()
+        return int(row["hub_chat_id"] or self.get("hub_chat_id") or 0) if row else 0
 
     def projects(self):
         return self.db.execute("SELECT * FROM projects ORDER BY name").fetchall()
@@ -129,14 +161,20 @@ class Store:
     def dialog(self, account_id: int, peer_id: int):
         return self.db.execute("SELECT * FROM dialogs WHERE account_id=? AND peer_id=?", (account_id, peer_id)).fetchone()
 
-    def by_topic(self, topic_id: int):
-        return self.db.execute("SELECT d.*,a.session_name,a.title,p.name project_name FROM dialogs d JOIN accounts a ON a.id=d.account_id LEFT JOIN projects p ON p.id=a.project_id WHERE d.topic_id=?", (topic_id,)).fetchone()
+    def by_topic(self, chat_id: int, topic_id: int):
+        return self.db.execute("SELECT d.*,a.session_name,a.title,p.name project_name FROM dialogs d JOIN accounts a ON a.id=d.account_id LEFT JOIN projects p ON p.id=a.project_id WHERE d.hub_chat_id=? AND d.topic_id=?", (chat_id, topic_id)).fetchone()
 
     def dialogs_for_account(self, account_id: int):
         return self.db.execute("SELECT * FROM dialogs WHERE account_id=?", (account_id,)).fetchall()
 
+    def dialogs_for_project(self, project_id: int):
+        return self.db.execute("SELECT d.*,a.session_name,a.title,a.project_id FROM dialogs d JOIN accounts a ON a.id=d.account_id WHERE a.project_id=?", (project_id,)).fetchall()
+
     def delete_dialog(self, account_id: int, peer_id: int):
         self.db.execute("DELETE FROM dialogs WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
+
+    def move_dialog(self, account_id: int, peer_id: int, topic_id: int, hub_chat_id: int):
+        self.db.execute("UPDATE dialogs SET topic_id=?,hub_chat_id=?,imported=0 WHERE account_id=? AND peer_id=?", (topic_id, hub_chat_id, account_id, peer_id)); self.db.execute("DELETE FROM copied_messages WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
 
     def account_by_id(self, account_id: int):
         return self.db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -188,8 +226,11 @@ class Store:
     def set_report_topic(self, project_id: int, topic_id: int):
         self.db.execute("INSERT INTO report_topics(project_id,topic_id) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET topic_id=excluded.topic_id", (project_id, topic_id)); self.db.commit()
 
-    def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str):
-        self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name) VALUES(?,?,?,?)", (account_id, peer_id, topic_id, peer_name)); self.db.commit()
+    def clear_report_topic(self, project_id: int):
+        self.db.execute("DELETE FROM report_topics WHERE project_id=?", (project_id,)); self.db.commit()
+
+    def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str, hub_chat_id: int):
+        self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name,hub_chat_id) VALUES(?,?,?,?,?)", (account_id, peer_id, topic_id, peer_name, hub_chat_id)); self.db.commit()
 
     def mark_imported(self, account_id: int, peer_id: int):
         self.db.execute("UPDATE dialogs SET imported=1 WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
@@ -273,12 +314,12 @@ class Hub:
     async def ensure_topic(self, account, peer_id: int, peer_name: str) -> int:
         existing = self.store.dialog(account["id"], peer_id)
         if existing: return existing["topic_id"]
-        chat_id = self.store.get("hub_chat_id")
+        chat_id = self.store.project_hub(account["project_id"])
         if not chat_id: raise RuntimeError("CRM group not configured: send /setup in the forum group")
         project = self.store.db.execute("SELECT name, color FROM projects WHERE id=?", (account["project_id"],)).fetchone()
         label = f"{peer_name} · {project['name'] if project else 'Без проекта'}"
         topic = await self.bot.topic(int(chat_id), label, project["color"] if project else None)
-        self.store.add_dialog(account["id"], peer_id, topic["message_thread_id"], peer_name)
+        self.store.add_dialog(account["id"], peer_id, topic["message_thread_id"], peer_name, chat_id)
         return topic["message_thread_id"]
 
     def message_text(self, message, outgoing: bool = False) -> str:
@@ -290,7 +331,9 @@ class Hub:
         """Idempotent bridge: a source Telegram message is copied to CRM only once."""
         async with self.copy_lock:
             if self.store.copied(account["id"], peer_id, message.id): return
-            await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
+            dialog = self.store.dialog(account["id"], peer_id)
+            if not dialog: return
+            await self.bot.send(dialog["hub_chat_id"], self.message_text(message, message.outgoing), topic_id)
             self.store.mark_copied(account["id"], peer_id, message.id)
 
     async def routed_message(self, client: Client, message):
@@ -342,12 +385,11 @@ class Hub:
             archived_ids = {dialog.chat.id async for dialog in self.folder_dialogs(client, 1, 500) if dialog.chat.type == ChatType.PRIVATE}
         self.archived_peers[client.dialoghub_session] = archived_ids
         if not archived_ids: return
-        chat_id = int(self.store.get("hub_chat_id") or 0)
         removed = 0
         for dialog in self.store.dialogs_for_account(account["id"]):
             if dialog["peer_id"] not in archived_ids: continue
             try:
-                if chat_id: await self.bot.delete_topic(chat_id, dialog["topic_id"])
+                if dialog["hub_chat_id"]: await self.bot.delete_topic(dialog["hub_chat_id"], dialog["topic_id"])
                 self.store.delete_dialog(account["id"], dialog["peer_id"]); removed += 1
                 await asyncio.sleep(1)
             except Exception:
@@ -376,11 +418,10 @@ class Hub:
         if client:
             try: await client.stop()
             except Exception: log.exception("Could not stop account client before deletion")
-        hub_chat_id = int(self.store.get("hub_chat_id") or 0)
         deleted = 0; failed = 0
         for dialog in dialogs:
             try:
-                if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                if dialog["hub_chat_id"]: await self.bot.delete_topic(dialog["hub_chat_id"], dialog["topic_id"])
                 self.store.delete_dialog(account_id, dialog["peer_id"]); deleted += 1
                 await asyncio.sleep(1)
             except Exception:
@@ -437,6 +478,41 @@ class Hub:
         finally:
             self.import_tasks.pop(client.dialoghub_session, None)
 
+    async def move_project_to_hub(self, project_id: int, target_chat_id: int):
+        """Recreate a project's CRM topics in another forum and preserve recent context."""
+        project = self.store.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not project: return
+        old_project_hub = self.store.project_hub(project_id)
+        self.store.bind_project_hub(project_id, target_chat_id)
+        old_report = self.store.report_topic(project_id)
+        if old_report:
+            self.store.clear_report_topic(project_id)
+            try:
+                if old_project_hub: await self.bot.delete_topic(old_project_hub, old_report)
+            except Exception:
+                log.exception("Could not delete old report topic for %s", project["name"])
+        for dialog in self.store.dialogs_for_project(project_id):
+            old_chat_id = dialog["hub_chat_id"]
+            if old_chat_id == target_chat_id: continue
+            account = self.store.account(dialog["session_name"])
+            client = self.clients.get(dialog["session_name"])
+            if not account or not client:
+                log.warning("Skipping project move for unavailable account %s", dialog["session_name"])
+                continue
+            label = f"{dialog['peer_name']} · {project['name']}"
+            try:
+                new_topic = await self.bot.topic(target_chat_id, label, project["color"])
+                self.store.move_dialog(account["id"], dialog["peer_id"], new_topic["message_thread_id"], target_chat_id)
+                history = [message async for message in client.get_chat_history(dialog["peer_id"], limit=20)]
+                for message in reversed(history):
+                    await self.copy_message(account, dialog["peer_id"], new_topic["message_thread_id"], message)
+                    await asyncio.sleep(4)
+                self.store.mark_imported(account["id"], dialog["peer_id"])
+                if old_chat_id: await self.bot.delete_topic(old_chat_id, dialog["topic_id"])
+            except Exception:
+                log.exception("Could not move CRM topic for project %s", project["name"])
+        await self.ensure_report_topic(project)
+
     async def start_account(self, session_name: str):
         if session_name in self.clients: return
         account = self.store.account(session_name)
@@ -464,10 +540,9 @@ class Hub:
 
     async def cleanup_stale_account(self, account, reason: str):
         log.warning("Removing stale account %s: %s", account["session_name"], reason)
-        hub_chat_id = int(self.store.get("hub_chat_id") or 0)
         for dialog in self.store.dialogs_for_account(account["id"]):
             try:
-                if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                if dialog["hub_chat_id"]: await self.bot.delete_topic(dialog["hub_chat_id"], dialog["topic_id"])
                 self.store.delete_dialog(account["id"], dialog["peer_id"])
                 await asyncio.sleep(1)
             except Exception: log.exception("Could not clean stale account topic %s", dialog["topic_id"])
@@ -640,13 +715,15 @@ class Hub:
         state = self.store.state(user_id); text = (message.get("text") or "").strip()
         if not state or not text or text.startswith("/") or not self.allowed(user_id): return False
         if state["action"] == "new_project":
-            self.store.add_project(text[:80]); self.store.clear_state(user_id)
+            self.store.add_project(text[:80])
             project_id = self.store.project_id(text[:80])
-            if project_id:
-                project = self.store.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
-                asyncio.create_task(self.ensure_report_topic(project))
-            await self.bot.send(message["chat"]["id"], f"✅ Проект «{html.escape(text[:80])}» добавлен.")
-            await self.projects_menu(message["chat"]["id"])
+            hubs = self.store.hubs()
+            if not project_id or not hubs:
+                self.store.clear_state(user_id)
+                await self.bot.send(message["chat"]["id"], "⚠️ Сначала добавьте бота в форум-беседу и отправьте там /setup.")
+                return True
+            self.store.set_state(user_id, "new_project_hub", str(project_id))
+            await self.bot.send(message["chat"]["id"], f"Проект «{html.escape(text[:80])}» создан. Выберите беседу для диалогов и отчётов:", markup=self.keyboard([[(hub["title"], f"project:hub:{project_id}:{hub['chat_id']}")] for hub in hubs]))
             return True
         if state["action"] == "new_account":
             project_id = int(state["payload"]); session = text.removesuffix(".session").strip()
@@ -726,12 +803,12 @@ class Hub:
                 try: await self.pin_report_topic(topic_id)
                 except Exception: log.exception("Could not pin report topic")
                 return topic_id
-            chat_id = self.store.get("hub_chat_id")
+            chat_id = self.store.project_hub(project["id"])
             if not chat_id: return None
-            topic = await self.bot.topic(int(chat_id), f"Отчёт · {project['name']}", project["color"])
+            topic = await self.bot.topic(chat_id, f"Отчёт · {project['name']}", project["color"])
             topic_id = topic["message_thread_id"]
             self.store.set_report_topic(project["id"], topic_id)
-            await self.bot.send(int(chat_id), f"<b>Отчёты проекта «{html.escape(project['name'])}»</b>\nЕжедневный отчёт приходит сюда в 00:00 МСК.", topic_id)
+            await self.bot.send(chat_id, f"<b>Отчёты проекта «{html.escape(project['name'])}»</b>\nЕжедневный отчёт приходит сюда в 00:00 МСК.", topic_id)
             await self.pin_report_topic(topic_id)
             return topic_id
 
@@ -757,7 +834,7 @@ class Hub:
                 text += "\n\n<b>Сработавшие скрипты</b>"
                 for script in project_scripts:
                     text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
-            await self.bot.send(int(self.store.get("hub_chat_id")), text, topic_id)
+            await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
 
     async def report_loop(self):
         while True:
@@ -791,6 +868,13 @@ class Hub:
             await self.accounts_menu(chat_id)
         elif data == "project:add" and self.allowed(user_id):
             self.store.set_state(user_id, "new_project"); await self.bot.send(chat_id, "Введите название нового проекта:")
+        elif data.startswith("project:hub:") and self.allowed(user_id):
+            _, _, project_id, hub_chat_id = data.split(":", 3)
+            self.store.bind_project_hub(int(project_id), int(hub_chat_id)); self.store.clear_state(user_id)
+            project = self.store.db.execute("SELECT * FROM projects WHERE id=?", (int(project_id),)).fetchone()
+            await self.ensure_report_topic(project)
+            await self.bot.send(chat_id, f"✅ Проект «{html.escape(project['name'])}» привязан к выбранной беседе. Там же создан топик отчёта.")
+            await self.projects_menu(chat_id)
         elif data == "account:add" and self.allowed(user_id):
             projects = self.store.projects()
             if not projects: await self.bot.send(chat_id, "Сначала создайте хотя бы один проект.")
@@ -815,13 +899,14 @@ class Hub:
         message = update.get("message") or update.get("edited_message")
         if not message: return
         if await self.handle_state_input(message): return
-        if message.get("chat", {}).get("id") != int(self.store.get("hub_chat_id") or 0): return
+        crm_chat_id = message.get("chat", {}).get("id")
+        if not any(hub["chat_id"] == crm_chat_id for hub in self.store.hubs()): return
         sender = message.get("from", {})
         if sender.get("is_bot") or not self.allowed(sender.get("id", 0)): return
         text = message.get("text") or message.get("caption")
         topic_id = message.get("message_thread_id")
         if not text or not topic_id: return
-        dialog = self.store.by_topic(topic_id)
+        dialog = self.store.by_topic(crm_chat_id, topic_id)
         if not dialog: return
         client = self.clients.get(dialog["session_name"])
         if not client: return
@@ -829,7 +914,7 @@ class Hub:
             await client.send_message(dialog["peer_id"], text)
         except Exception:
             log.exception("Could not send reply")
-            await self.bot.send(int(self.store.get("hub_chat_id")), "⚠️ Не удалось отправить ответ с рабочего аккаунта.", topic_id)
+            await self.bot.send(crm_chat_id, "⚠️ Не удалось отправить ответ с рабочего аккаунта.", topic_id)
 
     async def command(self, update: dict):
         message = update.get("message")
@@ -843,7 +928,16 @@ class Hub:
                 return True
             if not self.store.get("admin_ids") and not self.s.admins:
                 self.store.set("admin_ids", str(user_id))
-            self.store.set("hub_chat_id", str(chat["id"])); await self.bot.send(chat["id"], "✅ DialogHub подключён к этому чату.")
+            self.store.register_hub(chat["id"], chat.get("title") or f"CRM {chat['id']}")
+            if not self.store.get("hub_chat_id"):
+                self.store.set("hub_chat_id", str(chat["id"]))
+            project_name = " ".join(parts).strip()
+            project_id = self.store.project_id(project_name) if project_name else None
+            if project_id:
+                asyncio.create_task(self.move_project_to_hub(project_id, chat["id"]))
+                await self.bot.send(chat["id"], f"✅ Беседа привязана к проекту «{html.escape(project_name)}». Переношу его диалоги и отчёт сюда.")
+            else:
+                await self.bot.send(chat["id"], "✅ Беседа добавлена. Теперь её можно выбрать для проекта в личном меню бота.")
         elif command == "/project" and self.allowed(user_id):
             if parts:
                 name = " ".join(parts); self.store.add_project(name)
