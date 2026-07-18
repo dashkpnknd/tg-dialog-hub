@@ -213,7 +213,11 @@ class BotAPI:
         self.topic_interval_seconds = 25
 
     async def start(self): self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
-    async def close(self): await self.http.close()
+    async def close(self):
+        if self.http and not self.http.closed: await self.http.close()
+    async def reconnect(self):
+        await self.close()
+        await self.start()
     async def call(self, method: str, **payload):
         while True:
             async with self.http.post(f"{self.base}/{method}", json=payload) as response:
@@ -259,7 +263,7 @@ class BotAPI:
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock(); self.archived_peers = {}
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock(); self.archived_peers = {}; self.last_poll_activity = time.monotonic()
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -853,24 +857,38 @@ class Hub:
         offset = None
         while True:
             try:
+                self.last_poll_activity = time.monotonic()
                 updates = await self.bot.call("getUpdates", offset=offset, timeout=50, allowed_updates=["message", "edited_message", "callback_query"])
+                self.last_poll_activity = time.monotonic()
                 for update in updates:
                     offset = update["update_id"] + 1
                     if await self.callback(update): continue
                     if not await self.command(update): await self.reply(update)
+                    self.last_poll_activity = time.monotonic()
             except asyncio.CancelledError: raise
             except Exception:
                 log.exception("Bot polling error"); await asyncio.sleep(3)
 
+    async def poll_watchdog(self):
+        """Recover the Bot API long-poll connection if Telegram leaves it hanging."""
+        while True:
+            await asyncio.sleep(30)
+            if time.monotonic() - self.last_poll_activity > 90:
+                log.warning("Bot polling stalled; reconnecting Bot API session")
+                await self.bot.reconnect()
+                self.last_poll_activity = time.monotonic()
+
     async def run(self):
         await self.bot.start()
         report_task = asyncio.create_task(self.report_loop())
+        watchdog_task = asyncio.create_task(self.poll_watchdog())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
         try: await self.poll()
         finally:
             report_task.cancel()
+            watchdog_task.cancel()
             for client in self.clients.values(): await client.stop()
             await self.bot.close()
 
