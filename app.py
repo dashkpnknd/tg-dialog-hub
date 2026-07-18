@@ -566,6 +566,23 @@ class Hub:
         # QR login needs raw Telegram updates immediately after confirmation.
         return name, Client(name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir))
 
+    async def cancel_pending_login(self, user_id: int):
+        """A new login attempt replaces an abandoned one without a manual restart."""
+        task = self.pending_qr.pop(user_id, None)
+        if task and not task.done(): task.cancel()
+        auth = self.pending_auth.pop(user_id, None)
+        if auth:
+            client = auth.get("telethon_client") or auth.get("client")
+            try:
+                if client and (client.is_connected() if "telethon_client" in auth else client.is_connected): await client.disconnect()
+            except Exception:
+                log.debug("Could not close abandoned login", exc_info=True)
+            session_name = auth.get("session_name")
+            if session_name:
+                for suffix in (".session", ".session-journal"):
+                    (self.s.sessions_dir / f"{session_name}{suffix}").unlink(missing_ok=True)
+        self.store.clear_state(user_id)
+
     async def complete_login(self, chat_id: int, user_id: int, client: Client, project_id: int, session_name: str):
         me = await client.get_me()
         title = " ".join(filter(None, [me.first_name, me.last_name])) or str(me.id)
@@ -596,7 +613,7 @@ class Hub:
 
     async def begin_phone_login(self, chat_id: int, user_id: int, project_id: int):
         if user_id in self.pending_auth:
-            await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+            await self.cancel_pending_login(user_id)
         self.store.clear_state(user_id)
         session_name, client = self.new_login_client(user_id)
         try:
@@ -611,7 +628,7 @@ class Hub:
 
     async def begin_qr_login(self, chat_id: int, user_id: int, project_id: int):
         if user_id in self.pending_auth:
-            await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+            await self.cancel_pending_login(user_id)
         self.store.clear_state(user_id)
         session_name = f"dialoghub_{user_id}_{int(time.time())}"
         client = TelegramClient(StringSession(), self.s.api_id, self.s.api_hash)
