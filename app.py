@@ -295,7 +295,7 @@ class Hub:
         if not account:
             await self.bot.send(chat_id, "Этот аккаунт уже удалён."); return
         dialogs = self.store.dialogs_for_account(account_id)
-        status = await self.bot.send(chat_id, f"🗑 Начинаю удаление аккаунта «{html.escape(account['title'] or account['session_name'])}».\nТем к удалению: {len(dialogs)}")
+        status = await self.bot.send(chat_id, f"🗑 Удаляю аккаунт «{html.escape(account['title'] or account['session_name'])}».\nУдаление диалогов выполняется…")
         client = self.clients.pop(account["session_name"], None)
         if client:
             try: await client.stop()
@@ -306,7 +306,6 @@ class Hub:
             try:
                 if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
                 self.store.delete_dialog(account_id, dialog["peer_id"]); deleted += 1
-                await self.bot.edit(chat_id, status["message_id"], f"🗑 Удаляю аккаунт «{html.escape(account['title'] or account['session_name'])}».\nУдалено тем: {deleted} из {len(dialogs)}")
                 await asyncio.sleep(1)
             except Exception:
                 failed += 1; log.exception("Could not delete account topic %s", dialog["topic_id"])
@@ -315,7 +314,7 @@ class Hub:
         self.store.delete_account(account_id)
         result = "✅ Удаление завершено.\nАккаунт исчез из списка, сессия удалена."
         if failed: result += f"\n⚠️ Не удалось удалить тем: {failed}. Они будут удалены при следующем запуске очистки."
-        else: result += f"\nУдалено тем: {deleted}."
+        else: result += "\nВсе связанные темы удалены."
         await self.bot.edit(chat_id, status["message_id"], result)
 
     async def import_dialog(self, client: Client, account, peer_id: int, peer_name: str, history=None):
@@ -356,6 +355,18 @@ class Hub:
         if session_name in self.clients: return
         account = self.store.account(session_name)
         if not account: return
+        session_path = self.s.sessions_dir / f"{session_name}.session"
+        if not session_path.exists():
+            log.warning("Removing stale account %s: its session file is missing", session_name)
+            hub_chat_id = int(self.store.get("hub_chat_id") or 0)
+            for dialog in self.store.dialogs_for_account(account["id"]):
+                try:
+                    if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                    self.store.delete_dialog(account["id"], dialog["peer_id"])
+                    await asyncio.sleep(1)
+                except Exception: log.exception("Could not clean stale account topic %s", dialog["topic_id"])
+            self.store.delete_account(account["id"])
+            return
         client = Client(str(self.s.sessions_dir / session_name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=False)
         client.dialoghub_session = session_name
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
