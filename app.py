@@ -19,6 +19,9 @@ from pyrogram import Client, filters, raw, types, utils
 from pyrogram.errors import SessionPasswordNeeded
 from pyrogram.enums import ChatType
 from pyrogram.handlers import MessageHandler, RawUpdateHandler
+from telethon import TelegramClient
+from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
+from telethon.sessions import StringSession
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -507,24 +510,61 @@ class Hub:
         if user_id in self.pending_auth:
             await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
         self.store.clear_state(user_id)
-        session_name, client = self.new_login_client(user_id)
+        session_name = f"dialoghub_{user_id}_{int(time.time())}"
+        client = TelegramClient(StringSession(), self.s.api_id, self.s.api_hash)
         image_path = self.s.db_path.parent / f"qr_{user_id}.png"
-        event = asyncio.Event()
-        async def on_raw_update(_, update, __, ___):
-            if isinstance(update, raw.types.UpdateLoginToken): event.set()
         try:
             await asyncio.wait_for(client.connect(), timeout=45)
-            result = await self.export_qr_token(client)
-            if not isinstance(result, raw.types.auth.LoginToken): raise RuntimeError("Unexpected QR login response")
-            client.add_handler(RawUpdateHandler(on_raw_update))
-            await client.initialize()
-            self.pending_auth[user_id] = {"client": client, "project_id": project_id, "session_name": session_name}
-            task = asyncio.create_task(self.wait_qr_login(chat_id, user_id, client, result, event, image_path))
+            qr_login = await asyncio.wait_for(client.qr_login(), timeout=45)
+            self.pending_auth[user_id] = {"telethon_client": client, "project_id": project_id, "session_name": session_name}
+            task = asyncio.create_task(self.wait_telethon_qr_login(chat_id, user_id, client, qr_login, image_path))
             self.pending_qr[user_id] = task
         except Exception:
-            if client.is_connected: await client.disconnect()
+            if client.is_connected(): await client.disconnect()
             log.exception("Could not start QR login")
             await self.bot.send(chat_id, "⚠️ Не удалось создать QR-код. Выберите вход по номеру или попробуйте снова.")
+
+    async def pyrogram_client_from_telethon(self, telethon_client, session_name: str):
+        """Persist the successful QR session in Pyrogram's format for the CRM worker."""
+        me = await telethon_client.get_me()
+        bootstrap = Client(str(self.s.sessions_dir / session_name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=True)
+        await bootstrap.connect()
+        await bootstrap.storage.dc_id(telethon_client.session.dc_id)
+        await bootstrap.storage.auth_key(telethon_client.session.auth_key.key)
+        await bootstrap.storage.user_id(me.id)
+        await bootstrap.storage.is_bot(False)
+        await bootstrap.disconnect()
+        client = Client(str(self.s.sessions_dir / session_name), api_id=self.s.api_id, api_hash=self.s.api_hash, no_updates=True)
+        await client.connect()
+        return client
+
+    async def wait_telethon_qr_login(self, chat_id: int, user_id: int, client, qr_login, image_path: Path):
+        keep_client = False
+        try:
+            qrcode.make(qr_login.url).save(image_path)
+            await self.bot.photo(chat_id, image_path, "Откройте Telegram на подключаемом аккаунте: Настройки → Устройства → Подключить устройство. Отсканируйте QR.")
+            await asyncio.wait_for(qr_login.wait(), timeout=120)
+            data = self.pending_auth.get(user_id)
+            if not data: return
+            pyrogram_client = await self.pyrogram_client_from_telethon(client, data["session_name"])
+            await client.disconnect()
+            await self.complete_login(chat_id, user_id, pyrogram_client, data["project_id"], data["session_name"])
+        except SessionPasswordNeededError:
+            keep_client = True
+            self.store.set_state(user_id, "auth_password")
+            await self.bot.send(chat_id, "Введите пароль двухфакторной защиты подключаемого аккаунта:")
+        except asyncio.TimeoutError:
+            await self.bot.send(chat_id, "⌛ QR-код истёк. Выберите QR-код или вход по номеру заново.")
+        except Exception:
+            log.exception("Telethon QR login failed")
+            await self.bot.send(chat_id, "⚠️ Не удалось завершить QR-вход. Попробуйте ещё раз или войдите по номеру.")
+        finally:
+            self.pending_qr.pop(user_id, None)
+            data = self.pending_auth.get(user_id)
+            if not keep_client:
+                self.pending_auth.pop(user_id, None)
+                if data and client.is_connected(): await client.disconnect()
+            image_path.unlink(missing_ok=True)
 
     async def show_qr(self, chat_id: int, token: bytes, path: Path, refreshed: bool = False):
         encoded = base64.urlsafe_b64encode(token).decode().rstrip("=")
@@ -631,10 +671,19 @@ class Hub:
             if not auth:
                 self.store.clear_state(user_id); await self.bot.send(message["chat"]["id"], "Сессия входа истекла. Начните заново."); return True
             try:
-                await asyncio.wait_for(auth["client"].check_password(text), timeout=45)
-                await self.complete_login(message["chat"]["id"], user_id, auth["client"], auth["project_id"], auth["session_name"])
+                if "telethon_client" in auth:
+                    await asyncio.wait_for(auth["telethon_client"].sign_in(password=text), timeout=45)
+                    client = await self.pyrogram_client_from_telethon(auth["telethon_client"], auth["session_name"])
+                    await auth["telethon_client"].disconnect()
+                    await self.complete_login(message["chat"]["id"], user_id, client, auth["project_id"], auth["session_name"])
+                else:
+                    await asyncio.wait_for(auth["client"].check_password(text), timeout=45)
+                    await self.complete_login(message["chat"]["id"], user_id, auth["client"], auth["project_id"], auth["session_name"])
+            except PasswordHashInvalidError:
+                await self.bot.send(message["chat"]["id"], "⚠️ Telegram не принял пароль. Введите его ещё раз.")
             except Exception:
-                log.exception("Could not validate 2FA password"); await self.bot.send(message["chat"]["id"], "⚠️ Пароль не подошёл. Введите его ещё раз.")
+                log.exception("Could not validate 2FA password")
+                await self.bot.send(message["chat"]["id"], "⚠️ Не удалось проверить пароль из-за ошибки входа. Нажмите «Войти по QR-коду» и отсканируйте новый QR.")
             return True
         return False
 
