@@ -128,6 +128,8 @@ class Store:
         return self.db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
 
     def delete_account(self, account_id: int):
+        # A topic can already be gone in Telegram; database cleanup must still finish.
+        self.db.execute("DELETE FROM dialogs WHERE account_id=?", (account_id,))
         self.db.execute("DELETE FROM copied_messages WHERE account_id=?", (account_id,))
         self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,)); self.db.commit()
 
