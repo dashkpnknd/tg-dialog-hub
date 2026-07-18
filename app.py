@@ -378,7 +378,8 @@ class Hub:
         topic_id = existing["topic_id"] if existing else await self.ensure_topic(account, peer_id, peer_name)
         for message in reversed(history):
             await self.copy_message(account, peer_id, topic_id, message)
-            await asyncio.sleep(1.0)
+            # Leave Telegram capacity for bot buttons and live replies.
+            await asyncio.sleep(4.0)
         self.store.mark_imported(account["id"], peer_id)
         return True
 
@@ -398,7 +399,7 @@ class Hub:
                 history = [message async for message in client.get_chat_history(chat.id, limit=20)]
                 if await self.import_dialog(client, account, chat.id, peer_name, history):
                     imported += 1
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(5.0)
             except Exception:
                 log.exception("Could not import dialog for %s", client.dialoghub_session)
         log.info("Checked %s chats and imported %s replied dialogs for %s", checked, imported, client.dialoghub_session)
@@ -438,7 +439,8 @@ class Hub:
 
     def new_login_client(self, user_id: int):
         name = f"dialoghub_{user_id}_{int(time.time())}"
-        return name, Client(name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir), no_updates=True)
+        # QR login needs raw Telegram updates immediately after confirmation.
+        return name, Client(name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir))
 
     async def complete_login(self, chat_id: int, user_id: int, client: Client, project_id: int, session_name: str):
         me = await client.get_me()
