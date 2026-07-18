@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import datetime as dt
 import html
 import logging
 import os
@@ -9,6 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from dotenv import load_dotenv
@@ -22,6 +24,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dialoghub")
 PROJECT_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
+REPORT_TZ = ZoneInfo("Europe/Moscow")
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,14 @@ class Store:
         CREATE TABLE IF NOT EXISTS copied_messages (
           account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, source_message_id INTEGER NOT NULL,
           PRIMARY KEY(account_id, peer_id, source_message_id));
+        CREATE TABLE IF NOT EXISTS outreach_messages (
+          id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL,
+          source_message_id INTEGER NOT NULL, project_id INTEGER, script_label TEXT NOT NULL,
+          sent_at INTEGER NOT NULL, replied_at INTEGER,
+          UNIQUE(account_id, peer_id, source_message_id));
+        CREATE TABLE IF NOT EXISTS report_topics (
+          project_id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
+          FOREIGN KEY(project_id) REFERENCES projects(id));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
         if "color" not in columns:
@@ -138,6 +149,41 @@ class Store:
 
     def mark_copied(self, account_id: int, peer_id: int, source_message_id: int):
         self.db.execute("INSERT OR IGNORE INTO copied_messages(account_id,peer_id,source_message_id) VALUES(?,?,?)", (account_id, peer_id, source_message_id)); self.db.commit()
+
+    def track_outreach(self, account, peer_id: int, message):
+        text = (message.text or message.caption or "[медиа/файл]").strip()
+        label = " ".join(text.split())[:160] or "[медиа/файл]"
+        sent_at = int(message.date.timestamp()) if message.date else int(dt.datetime.now(dt.timezone.utc).timestamp())
+        self.db.execute("INSERT OR IGNORE INTO outreach_messages(account_id,peer_id,source_message_id,project_id,script_label,sent_at) VALUES(?,?,?,?,?,?)", (account["id"], peer_id, message.id, account["project_id"], label, sent_at)); self.db.commit()
+
+    def mark_reply(self, account_id: int, peer_id: int, replied_at: int):
+        row = self.db.execute("SELECT id FROM outreach_messages WHERE account_id=? AND peer_id=? AND replied_at IS NULL ORDER BY sent_at DESC LIMIT 1", (account_id, peer_id)).fetchone()
+        if row:
+            self.db.execute("UPDATE outreach_messages SET replied_at=? WHERE id=?", (replied_at, row["id"])); self.db.commit()
+
+    def daily_stats(self, start_ts: int, end_ts: int):
+        projects = self.db.execute("""
+          SELECT COALESCE(p.name, 'Без проекта') name,
+                 SUM(CASE WHEN o.sent_at>=? AND o.sent_at<? THEN 1 ELSE 0 END) sent,
+                 SUM(CASE WHEN o.replied_at>=? AND o.replied_at<? THEN 1 ELSE 0 END) replied
+          FROM outreach_messages o LEFT JOIN projects p ON p.id=o.project_id
+          WHERE (o.sent_at>=? AND o.sent_at<?) OR (o.replied_at>=? AND o.replied_at<?)
+          GROUP BY COALESCE(p.name, 'Без проекта') ORDER BY name
+        """, (start_ts, end_ts, start_ts, end_ts, start_ts, end_ts, start_ts, end_ts)).fetchall()
+        scripts = self.db.execute("""
+          SELECT p.name project_name, o.script_label, COUNT(*) replies
+          FROM outreach_messages o JOIN projects p ON p.id=o.project_id
+          WHERE o.replied_at>=? AND o.replied_at<? AND (lower(p.name) LIKE '%тендер%' OR lower(p.name) LIKE '%трейдинг%')
+          GROUP BY p.name, o.script_label HAVING COUNT(*)>0 ORDER BY p.name, replies DESC
+        """, (start_ts, end_ts)).fetchall()
+        return projects, scripts
+
+    def report_topic(self, project_id: int):
+        row = self.db.execute("SELECT topic_id FROM report_topics WHERE project_id=?", (project_id,)).fetchone()
+        return row["topic_id"] if row else None
+
+    def set_report_topic(self, project_id: int, topic_id: int):
+        self.db.execute("INSERT INTO report_topics(project_id,topic_id) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET topic_id=excluded.topic_id", (project_id, topic_id)); self.db.commit()
 
     def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str):
         self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name) VALUES(?,?,?,?)", (account_id, peer_id, topic_id, peer_name)); self.db.commit()
@@ -210,7 +256,8 @@ class BotAPI:
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock()
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock()
+        self.forum_admin = Client("dialoghub_forum_admin", api_id=settings.api_id, api_hash=settings.api_hash, bot_token=settings.token, workdir=str(settings.db_path.parent), no_updates=True)
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -249,7 +296,11 @@ class Hub:
         try:
             dialog = self.store.dialog(account["id"], peer.id)
             if message.outgoing and not dialog:
+                self.store.track_outreach(account, peer.id, message)
                 return
+            if not message.outgoing:
+                replied_at = int(message.date.timestamp()) if message.date else int(dt.datetime.now(dt.timezone.utc).timestamp())
+                self.store.mark_reply(account["id"], peer.id, replied_at)
             if not dialog:
                 await self.import_dialog(client, account, peer.id, peer_name)
                 return
@@ -516,6 +567,10 @@ class Hub:
         if not state or not text or text.startswith("/") or not self.allowed(user_id): return False
         if state["action"] == "new_project":
             self.store.add_project(text[:80]); self.store.clear_state(user_id)
+            project_id = self.store.project_id(text[:80])
+            if project_id:
+                project = self.store.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+                asyncio.create_task(self.ensure_report_topic(project))
             await self.bot.send(message["chat"]["id"], f"✅ Проект «{html.escape(text[:80])}» добавлен.")
             await self.projects_menu(message["chat"]["id"])
             return True
@@ -575,6 +630,67 @@ class Hub:
         buttons = [[(f"🗑 {a['title'] or a['session_name']}", f"account:delete:{a['id']}")] for a in accounts]
         buttons += [[("➕ Добавить аккаунт", "account:add")], [("⬅️ Назад", "menu:main")]]
         await self.bot.send(chat_id, text, markup=self.keyboard(buttons))
+
+    async def pin_report_topic(self, topic_id: int):
+        chat_id = int(self.store.get("hub_chat_id") or 0)
+        if not chat_id or not self.forum_admin.is_connected: return
+        peer = await self.forum_admin.resolve_peer(chat_id)
+        if not isinstance(peer, raw.types.InputPeerChannel): return
+        channel = raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+        await self.forum_admin.invoke(raw.functions.channels.UpdatePinnedForumTopic(channel=channel, topic_id=topic_id, pinned=True))
+
+    async def ensure_report_topic(self, project):
+        async with self.report_lock:
+            topic_id = self.store.report_topic(project["id"])
+            if topic_id:
+                try: await self.pin_report_topic(topic_id)
+                except Exception: log.exception("Could not pin report topic")
+                return topic_id
+            chat_id = self.store.get("hub_chat_id")
+            if not chat_id: return None
+            topic = await self.bot.topic(int(chat_id), f"Отчёт · {project['name']}", project["color"])
+            topic_id = topic["message_thread_id"]
+            self.store.set_report_topic(project["id"], topic_id)
+            await self.bot.send(int(chat_id), f"<b>Отчёты проекта «{html.escape(project['name'])}»</b>\nЕжедневный отчёт приходит сюда в 00:00 МСК.", topic_id)
+            await self.pin_report_topic(topic_id)
+            return topic_id
+
+    async def ensure_all_report_topics(self):
+        for project in self.store.projects():
+            try: await self.ensure_report_topic(project)
+            except Exception: log.exception("Could not create report topic for %s", project["name"])
+
+    async def send_daily_report(self, report_day: dt.date):
+        start = dt.datetime.combine(report_day, dt.time.min, tzinfo=REPORT_TZ)
+        end = start + dt.timedelta(days=1)
+        projects, scripts = self.store.daily_stats(int(start.timestamp()), int(end.timestamp()))
+        project_rows = {row["name"]: row for row in projects}
+        scripts_by_project = {}
+        for row in scripts: scripts_by_project.setdefault(row["project_name"], []).append(row)
+        for project in self.store.projects():
+            topic_id = await self.ensure_report_topic(project)
+            if not topic_id: continue
+            row = project_rows.get(project["name"]); sent = row["sent"] if row else 0; replied = row["replied"] if row else 0
+            text = f"<b>Отчёт · {html.escape(project['name'])}</b>\n{report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
+            project_scripts = scripts_by_project.get(project["name"], [])
+            if project_scripts:
+                text += "\n\n<b>Сработавшие скрипты</b>"
+                for script in project_scripts:
+                    text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
+            await self.bot.send(int(self.store.get("hub_chat_id")), text, topic_id)
+
+    async def report_loop(self):
+        while True:
+            now = dt.datetime.now(REPORT_TZ)
+            next_midnight = dt.datetime.combine(now.date() + dt.timedelta(days=1), dt.time.min, tzinfo=REPORT_TZ)
+            await asyncio.sleep(max(1, (next_midnight - now).total_seconds()))
+            report_day = next_midnight.date() - dt.timedelta(days=1)
+            key = f"report_sent_{report_day.isoformat()}"
+            if self.store.get(key): continue
+            try:
+                await self.send_daily_report(report_day)
+                self.store.set(key, "1")
+            except Exception: log.exception("Could not send daily report")
 
     async def callback(self, update: dict):
         query = update.get("callback_query")
@@ -649,7 +765,11 @@ class Hub:
                 self.store.set("admin_ids", str(user_id))
             self.store.set("hub_chat_id", str(chat["id"])); await self.bot.send(chat["id"], "✅ DialogHub подключён к этому чату.")
         elif command == "/project" and self.allowed(user_id):
-            if parts: self.store.add_project(" ".join(parts)); await self.bot.send(chat["id"], "✅ Проект добавлен.")
+            if parts:
+                name = " ".join(parts); self.store.add_project(name)
+                project_id = self.store.project_id(name)
+                if project_id: asyncio.create_task(self.ensure_report_topic(self.store.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()))
+                await self.bot.send(chat["id"], "✅ Проект добавлен.")
         elif command == "/account" and self.allowed(user_id):
             if len(parts) >= 2:
                 project = self.store.project_id(parts[0]); session = parts[1]
@@ -679,11 +799,16 @@ class Hub:
 
     async def run(self):
         await self.bot.start()
+        await self.forum_admin.start()
+        report_task = asyncio.create_task(self.report_loop())
+        asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
-            await self.start_account(account["session_name"])
+            asyncio.create_task(self.start_account(account["session_name"]))
         try: await self.poll()
         finally:
+            report_task.cancel()
             for client in self.clients.values(): await client.stop()
+            await self.forum_admin.stop()
             await self.bot.close()
 
 
