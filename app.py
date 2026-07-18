@@ -256,7 +256,7 @@ class BotAPI:
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock()
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock(); self.archived_peers = {}
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -291,6 +291,8 @@ class Hub:
         account = self.store.account(client.dialoghub_session)
         if not account: return
         peer = message.chat
+        if peer.id in self.archived_peers.get(client.dialoghub_session, set()):
+            return
         peer_name = " ".join(filter(None, [peer.first_name, peer.last_name])) or peer.username or str(peer.id)
         try:
             dialog = self.store.dialog(account["id"], peer.id)
@@ -329,6 +331,7 @@ class Hub:
 
     async def remove_archived_topics(self, client: Client, account):
         archived_ids = {dialog.chat.id async for dialog in self.folder_dialogs(client, 1, 500) if dialog.chat.type == ChatType.PRIVATE}
+        self.archived_peers[client.dialoghub_session] = archived_ids
         if not archived_ids: return
         chat_id = int(self.store.get("hub_chat_id") or 0)
         removed = 0
