@@ -13,7 +13,7 @@ from typing import Optional
 import aiohttp
 from dotenv import load_dotenv
 import qrcode
-from pyrogram import Client, filters, raw
+from pyrogram import Client, filters, raw, types, utils
 from pyrogram.errors import SessionPasswordNeeded
 from pyrogram.enums import ChatType
 from pyrogram.handlers import MessageHandler, RawUpdateHandler
@@ -67,6 +67,9 @@ class Store:
           FOREIGN KEY(account_id) REFERENCES accounts(id));
         CREATE TABLE IF NOT EXISTS user_states (
           user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT);
+        CREATE TABLE IF NOT EXISTS copied_messages (
+          account_id INTEGER NOT NULL, peer_id INTEGER NOT NULL, source_message_id INTEGER NOT NULL,
+          PRIMARY KEY(account_id, peer_id, source_message_id));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
         if "color" not in columns:
@@ -114,6 +117,25 @@ class Store:
 
     def by_topic(self, topic_id: int):
         return self.db.execute("SELECT d.*,a.session_name,a.title,p.name project_name FROM dialogs d JOIN accounts a ON a.id=d.account_id LEFT JOIN projects p ON p.id=a.project_id WHERE d.topic_id=?", (topic_id,)).fetchone()
+
+    def dialogs_for_account(self, account_id: int):
+        return self.db.execute("SELECT * FROM dialogs WHERE account_id=?", (account_id,)).fetchall()
+
+    def delete_dialog(self, account_id: int, peer_id: int):
+        self.db.execute("DELETE FROM dialogs WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
+
+    def account_by_id(self, account_id: int):
+        return self.db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+
+    def delete_account(self, account_id: int):
+        self.db.execute("DELETE FROM copied_messages WHERE account_id=?", (account_id,))
+        self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,)); self.db.commit()
+
+    def copied(self, account_id: int, peer_id: int, source_message_id: int) -> bool:
+        return self.db.execute("SELECT 1 FROM copied_messages WHERE account_id=? AND peer_id=? AND source_message_id=?", (account_id, peer_id, source_message_id)).fetchone() is not None
+
+    def mark_copied(self, account_id: int, peer_id: int, source_message_id: int):
+        self.db.execute("INSERT OR IGNORE INTO copied_messages(account_id,peer_id,source_message_id) VALUES(?,?,?)", (account_id, peer_id, source_message_id)); self.db.commit()
 
     def add_dialog(self, account_id: int, peer_id: int, topic_id: int, peer_name: str):
         self.db.execute("INSERT INTO dialogs(account_id,peer_id,topic_id,peer_name) VALUES(?,?,?,?)", (account_id, peer_id, topic_id, peer_name)); self.db.commit()
@@ -178,11 +200,13 @@ class BotAPI:
             result = await self.call("createForumTopic", **body)
             self.last_topic_created_at = time.monotonic()
             return result
+    async def delete_topic(self, chat_id: int, topic_id: int):
+        return await self.call("deleteForumTopic", chat_id=chat_id, message_thread_id=topic_id)
 
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock()
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -205,6 +229,13 @@ class Hub:
         body = html.escape(message.text or message.caption or "[медиа/файл]")
         return f"{direction}\n{body}"
 
+    async def copy_message(self, account, peer_id: int, topic_id: int, message):
+        """Idempotent bridge: a source Telegram message is copied to CRM only once."""
+        async with self.copy_lock:
+            if self.store.copied(account["id"], peer_id, message.id): return
+            await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
+            self.store.mark_copied(account["id"], peer_id, message.id)
+
     async def routed_message(self, client: Client, message):
         if message.chat.type not in (ChatType.PRIVATE,): return
         account = self.store.account(client.dialoghub_session)
@@ -219,9 +250,62 @@ class Hub:
                 await self.import_dialog(client, account, peer.id, peer_name)
                 return
             topic_id = dialog["topic_id"]
-            await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
+            await self.copy_message(account, peer.id, topic_id, message)
         except Exception:
             log.exception("Could not route message")
+
+    async def folder_dialogs(self, client: Client, folder_id: int, limit: int):
+        """Pyrogram's dialog iterator with an explicit Telegram folder (0 = main, 1 = archive)."""
+        current = 0; offset_date = 0; offset_id = 0; offset_peer = raw.types.InputPeerEmpty()
+        while current < limit:
+            result = await client.invoke(raw.functions.messages.GetDialogs(
+                offset_date=offset_date, offset_id=offset_id, offset_peer=offset_peer,
+                limit=min(100, limit - current), hash=0, folder_id=folder_id), sleep_threshold=60)
+            users = {item.id: item for item in result.users}; chats = {item.id: item for item in result.chats}; messages = {}
+            for raw_message in result.messages:
+                if isinstance(raw_message, raw.types.MessageEmpty): continue
+                peer_id = utils.get_peer_id(raw_message.peer_id)
+                messages[peer_id] = await types.Message._parse(client, raw_message, users, chats)
+            dialogs = [types.Dialog._parse(client, item, messages, users, chats) for item in result.dialogs if isinstance(item, raw.types.Dialog)]
+            if not dialogs: return
+            last = dialogs[-1]; offset_id = last.top_message.id; offset_date = utils.datetime_to_timestamp(last.top_message.date); offset_peer = await client.resolve_peer(last.chat.id)
+            for dialog in dialogs:
+                yield dialog; current += 1
+                if current >= limit: return
+
+    async def remove_archived_topics(self, client: Client, account):
+        archived_ids = {dialog.chat.id async for dialog in self.folder_dialogs(client, 1, 500) if dialog.chat.type == ChatType.PRIVATE}
+        if not archived_ids: return
+        chat_id = int(self.store.get("hub_chat_id") or 0)
+        removed = 0
+        for dialog in self.store.dialogs_for_account(account["id"]):
+            if dialog["peer_id"] not in archived_ids: continue
+            try:
+                if chat_id: await self.bot.delete_topic(chat_id, dialog["topic_id"])
+                self.store.delete_dialog(account["id"], dialog["peer_id"]); removed += 1
+                await asyncio.sleep(1)
+            except Exception:
+                log.exception("Could not delete archived CRM topic")
+        if removed: log.info("Removed %s archived CRM topics for %s", removed, client.dialoghub_session)
+
+    async def delete_account_from_hub(self, chat_id: int, account_id: int):
+        account = self.store.account_by_id(account_id)
+        if not account:
+            await self.bot.send(chat_id, "Этот аккаунт уже удалён."); return
+        client = self.clients.pop(account["session_name"], None)
+        if client:
+            try: await client.stop()
+            except Exception: log.exception("Could not stop account client before deletion")
+        hub_chat_id = int(self.store.get("hub_chat_id") or 0)
+        for dialog in self.store.dialogs_for_account(account_id):
+            try:
+                if hub_chat_id: await self.bot.delete_topic(hub_chat_id, dialog["topic_id"])
+                await asyncio.sleep(1)
+            except Exception: log.exception("Could not delete account topic %s", dialog["topic_id"])
+        for suffix in (".session", ".session-journal"):
+            (self.s.sessions_dir / f"{account['session_name']}{suffix}").unlink(missing_ok=True)
+        self.store.delete_account(account_id)
+        await self.bot.send(chat_id, "✅ Аккаунт, его сессия и все связанные темы удалены.")
 
     async def import_dialog(self, client: Client, account, peer_id: int, peer_name: str, history=None):
         """Create a topic only after a real client reply, then copy its recent context."""
@@ -231,7 +315,7 @@ class Hub:
         if not any(not message.outgoing for message in history): return False
         topic_id = existing["topic_id"] if existing else await self.ensure_topic(account, peer_id, peer_name)
         for message in reversed(history):
-            await self.bot.send(int(self.store.get("hub_chat_id")), self.message_text(message, message.outgoing), topic_id)
+            await self.copy_message(account, peer_id, topic_id, message)
             await asyncio.sleep(1.0)
         self.store.mark_imported(account["id"], peer_id)
         return True
@@ -240,7 +324,7 @@ class Hub:
         """Import up to 50 recent private chats where the other person has replied."""
         imported = 0
         checked = 0
-        async for dialog in client.get_dialogs(limit=250):
+        async for dialog in self.folder_dialogs(client, 0, 250):
             if imported >= 50: break
             chat = dialog.chat
             existing = self.store.dialog(account["id"], chat.id)
@@ -266,6 +350,7 @@ class Hub:
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         await client.start(); self.clients[session_name] = client
         log.info("Account started: %s", session_name)
+        await self.remove_archived_topics(client, account)
         await self.import_recent_replied_dialogs(client, account)
 
     def new_login_client(self, user_id: int):
@@ -454,7 +539,9 @@ class Hub:
     async def accounts_menu(self, chat_id: int):
         accounts = self.store.accounts()
         text = "<b>Аккаунты</b>\n" + ("\n".join(f"• {html.escape(a['title'] or a['session_name'])} — {html.escape(a['project_name'] or 'Без проекта')}" for a in accounts) if accounts else "Пока нет подключённых аккаунтов.")
-        await self.bot.send(chat_id, text, markup=self.keyboard([[("➕ Добавить аккаунт", "account:add")], [("⬅️ Назад", "menu:main")]]))
+        buttons = [[(f"🗑 {a['title'] or a['session_name']}", f"account:delete:{a['id']}")] for a in accounts]
+        buttons += [[("➕ Добавить аккаунт", "account:add")], [("⬅️ Назад", "menu:main")]]
+        await self.bot.send(chat_id, text, markup=self.keyboard(buttons))
 
     async def callback(self, update: dict):
         query = update.get("callback_query")
@@ -470,6 +557,9 @@ class Hub:
             await self.bot.send(chat_id, f"<b>Статус</b>\nПроектов: {len(self.store.projects())}\nПодключённых аккаунтов: {len(self.store.accounts())}")
         elif data == "menu:help":
             await self.bot.send(chat_id, "<b>Как начать</b>\n1. В CRM-группе: /setup\n2. В меню создайте проект\n3. Добавьте аккаунт в проект")
+        elif data.startswith("account:delete:") and self.allowed(user_id):
+            await self.delete_account_from_hub(chat_id, int(data.rsplit(":", 1)[1]))
+            await self.accounts_menu(chat_id)
         elif data == "project:add" and self.allowed(user_id):
             self.store.set_state(user_id, "new_project"); await self.bot.send(chat_id, "Введите название нового проекта:")
         elif data == "account:add" and self.allowed(user_id):
