@@ -634,7 +634,13 @@ class Hub:
     async def pin_report_topic(self, topic_id: int):
         chat_id = int(self.store.get("hub_chat_id") or 0)
         if not chat_id or not self.forum_admin.is_connected: return
-        peer = await self.forum_admin.resolve_peer(chat_id)
+        try:
+            peer = await self.forum_admin.resolve_peer(chat_id)
+        except (KeyError, ValueError):
+            # Populate the MTProto bot session cache with its groups before pinning.
+            async for dialog in self.forum_admin.get_dialogs(limit=100):
+                if dialog.chat.id == chat_id: break
+            peer = await self.forum_admin.resolve_peer(chat_id)
         if not isinstance(peer, raw.types.InputPeerChannel): return
         channel = raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
         await self.forum_admin.invoke(raw.functions.channels.UpdatePinnedForumTopic(channel=channel, topic_id=topic_id, pinned=True))
