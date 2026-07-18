@@ -257,7 +257,6 @@ class BotAPI:
 class Hub:
     def __init__(self, settings: Settings):
         self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}; self.pending_auth = {}; self.copy_lock = asyncio.Lock(); self.report_lock = asyncio.Lock()
-        self.forum_admin = Client("dialoghub_forum_admin", api_id=settings.api_id, api_hash=settings.api_hash, bot_token=settings.token, workdir=str(settings.db_path.parent), no_updates=True)
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -632,18 +631,9 @@ class Hub:
         await self.bot.send(chat_id, text, markup=self.keyboard(buttons))
 
     async def pin_report_topic(self, topic_id: int):
-        chat_id = int(self.store.get("hub_chat_id") or 0)
-        if not chat_id or not self.forum_admin.is_connected: return
-        try:
-            peer = await self.forum_admin.resolve_peer(chat_id)
-        except (KeyError, ValueError):
-            # Populate the MTProto bot session cache with its groups before pinning.
-            async for dialog in self.forum_admin.get_dialogs(limit=100):
-                if dialog.chat.id == chat_id: break
-            peer = await self.forum_admin.resolve_peer(chat_id)
-        if not isinstance(peer, raw.types.InputPeerChannel): return
-        channel = raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
-        await self.forum_admin.invoke(raw.functions.channels.UpdatePinnedForumTopic(channel=channel, topic_id=topic_id, pinned=True))
+        # Telegram Bot API can create forum topics but cannot pin forum topics.
+        # A user-admin session is required for this optional visual action.
+        return
 
     async def ensure_report_topic(self, project):
         async with self.report_lock:
@@ -805,7 +795,6 @@ class Hub:
 
     async def run(self):
         await self.bot.start()
-        await self.forum_admin.start()
         report_task = asyncio.create_task(self.report_loop())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
@@ -814,7 +803,6 @@ class Hub:
         finally:
             report_task.cancel()
             for client in self.clients.values(): await client.stop()
-            await self.forum_admin.stop()
             await self.bot.close()
 
 
