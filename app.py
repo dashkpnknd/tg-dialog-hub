@@ -1,15 +1,18 @@
 import asyncio
+import base64
 import html
 import logging
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+import qrcode
+from pyrogram import Client, filters, raw
 from pyrogram.enums import ChatType
 from pyrogram.handlers import MessageHandler
 
@@ -130,13 +133,21 @@ class BotAPI:
         if markup: body["reply_markup"] = markup
         return await self.call("sendMessage", **body)
     async def answer(self, callback_id: str): return await self.call("answerCallbackQuery", callback_query_id=callback_id)
+    async def photo(self, chat_id: int, path: Path, caption: str):
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id)); form.add_field("caption", caption, content_type="text/plain")
+        form.add_field("photo", path.read_bytes(), filename=path.name, content_type="image/png")
+        async with self.http.post(f"{self.base}/sendPhoto", data=form) as response:
+            data = await response.json()
+        if not data.get("ok"): raise RuntimeError(data.get("description", "Telegram API error"))
+        return data["result"]
     async def topic(self, chat_id: int, title: str):
         return await self.call("createForumTopic", chat_id=chat_id, name=title[:128])
 
 
 class Hub:
     def __init__(self, settings: Settings):
-        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}
+        self.s = settings; self.store = Store(settings.db_path); self.bot = BotAPI(settings.token); self.clients = {}; self.pending_qr = {}
 
     def allowed(self, user_id: int) -> bool:
         stored = {int(x) for x in (self.store.get("admin_ids") or "").split(",") if x}
@@ -219,6 +230,50 @@ class Hub:
         log.info("Account started: %s", session_name)
         await self.import_recent_replied_dialogs(client, account)
 
+    async def begin_qr_login(self, chat_id: int, user_id: int, project_id: int):
+        if user_id in self.pending_qr:
+            await self.bot.send(chat_id, "QR уже отправлен. Отсканируйте его в Telegram или подождите две минуты.")
+            return
+        session_name = f"dialoghub_{user_id}_{int(time.time())}"
+        client = Client(session_name, api_id=self.s.api_id, api_hash=self.s.api_hash, workdir=str(self.s.sessions_dir), no_updates=True)
+        try:
+            await client.connect()
+            token = await client.invoke(raw.functions.auth.ExportLoginToken(api_id=self.s.api_id, api_hash=self.s.api_hash, except_ids=[]))
+            if not isinstance(token, raw.types.auth.LoginToken):
+                raise RuntimeError("Не удалось создать QR-код. Попробуйте ещё раз.")
+            encoded = base64.urlsafe_b64encode(token.token).decode().rstrip("=")
+            image_path = self.s.db_path.parent / f"qr_{user_id}.png"
+            qrcode.make(f"tg://login?token={encoded}").save(image_path)
+            await self.bot.photo(chat_id, image_path, "Откройте Telegram на подключаемом аккаунте: Настройки → Устройства → Подключить устройство. Отсканируйте QR. Код действует около 2 минут.")
+            task = asyncio.create_task(self.wait_qr_login(chat_id, user_id, project_id, session_name, client, token.token, image_path))
+            self.pending_qr[user_id] = task
+        except Exception:
+            if client.is_connected: await client.disconnect()
+            log.exception("Could not start QR login")
+            await self.bot.send(chat_id, "⚠️ Не удалось создать QR-код. Попробуйте ещё раз.")
+
+    async def wait_qr_login(self, chat_id: int, user_id: int, project_id: int, session_name: str, client: Client, token: bytes, image_path: Path):
+        try:
+            for _ in range(60):
+                await asyncio.sleep(2)
+                result = await client.invoke(raw.functions.auth.ImportLoginToken(token=token))
+                if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                    user = result.authorization.user
+                    title = " ".join(filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])) or str(user.id)
+                    await client.disconnect()
+                    self.store.add_account(session_name, project_id, title)
+                    await self.bot.send(chat_id, f"✅ Аккаунт «{html.escape(title)}» подключён. Импортирую диалоги с ответами клиентов…")
+                    await self.start_account(session_name)
+                    return
+            await self.bot.send(chat_id, "⌛ QR-код истёк. Нажмите «Добавить аккаунт» и попробуйте снова.")
+        except Exception:
+            log.exception("QR login failed")
+            await self.bot.send(chat_id, "⚠️ Не удалось завершить вход. Попробуйте создать новый QR-код.")
+        finally:
+            self.pending_qr.pop(user_id, None)
+            if client.is_connected: await client.disconnect()
+            image_path.unlink(missing_ok=True)
+
     @staticmethod
     def keyboard(rows):
         return {"inline_keyboard": [[{"text": text, "callback_data": data} for text, data in row] for row in rows]}
@@ -281,6 +336,15 @@ class Hub:
             if not projects: await self.bot.send(chat_id, "Сначала создайте хотя бы один проект.")
             else: await self.bot.send(chat_id, "Выберите проект:", markup=self.keyboard([[(p["name"], f"account:project:{p['id']}")] for p in projects] + [[("⬅️ Назад", "menu:accounts")]]))
         elif data.startswith("account:project:") and self.allowed(user_id):
+            project_id = data.rsplit(":", 1)[1]
+            await self.bot.send(chat_id, "Выберите способ подключения:", markup=self.keyboard([
+                [("📷 Войти по QR-коду", f"account:qr:{project_id}")],
+                [("📁 Подключить готовую session", f"account:session:{project_id}")],
+                [("⬅️ Назад", "account:add")],
+            ]))
+        elif data.startswith("account:qr:") and self.allowed(user_id):
+            await self.begin_qr_login(chat_id, user_id, int(data.rsplit(":", 1)[1]))
+        elif data.startswith("account:session:") and self.allowed(user_id):
             self.store.set_state(user_id, "new_account", data.rsplit(":", 1)[1]); await self.bot.send(chat_id, "Введите имя файла сессии без <code>.session</code>.")
         return True
 

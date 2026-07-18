@@ -2,3 +2,4 @@ Pyrogram==2.0.106
 TgCrypto==1.2.5
 aiohttp==3.10.11
 python-dotenv==1.0.1
+qrcode[pil]==8.2
