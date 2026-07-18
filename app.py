@@ -3,6 +3,7 @@ import base64
 import html
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from pyrogram.handlers import MessageHandler, RawUpdateHandler
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dialoghub")
+PROJECT_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 
 
 @dataclass(frozen=True)
@@ -54,7 +56,7 @@ class Store:
         self.db.executescript("""
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, color INTEGER);
         CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY, session_name TEXT UNIQUE NOT NULL, project_id INTEGER,
           title TEXT, enabled INTEGER NOT NULL DEFAULT 1,
@@ -66,6 +68,11 @@ class Store:
         CREATE TABLE IF NOT EXISTS user_states (
           user_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
+        if "color" not in columns:
+            self.db.execute("ALTER TABLE projects ADD COLUMN color INTEGER")
+        for project in self.db.execute("SELECT id FROM projects WHERE color IS NULL").fetchall():
+            self.db.execute("UPDATE projects SET color=? WHERE id=?", (PROJECT_COLORS[(project["id"] - 1) % len(PROJECT_COLORS)], project["id"]))
         self.db.commit()
 
     def get(self, key: str) -> Optional[str]:
@@ -78,6 +85,9 @@ class Store:
 
     def add_project(self, name: str):
         self.db.execute("INSERT OR IGNORE INTO projects(name) VALUES(?)", (name,)); self.db.commit()
+        row = self.db.execute("SELECT id, color FROM projects WHERE name=?", (name,)).fetchone()
+        if row and row["color"] is None:
+            self.db.execute("UPDATE projects SET color=? WHERE id=?", (PROJECT_COLORS[(row["id"] - 1) % len(PROJECT_COLORS)], row["id"])); self.db.commit()
 
     def projects(self):
         return self.db.execute("SELECT * FROM projects ORDER BY name").fetchall()
@@ -123,11 +133,20 @@ class BotAPI:
     async def start(self): self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     async def close(self): await self.http.close()
     async def call(self, method: str, **payload):
-        async with self.http.post(f"{self.base}/{method}", json=payload) as response:
-            data = await response.json()
-        if not data.get("ok"):
+        for _ in range(5):
+            async with self.http.post(f"{self.base}/{method}", json=payload) as response:
+                data = await response.json()
+            if data.get("ok"): return data["result"]
+            retry_after = data.get("parameters", {}).get("retry_after")
+            if retry_after is None:
+                match = re.search(r"retry after (\d+)", data.get("description", ""), re.I)
+                retry_after = int(match.group(1)) if match else None
+            if retry_after:
+                log.warning("Telegram rate limit for %s; waiting %s seconds", method, retry_after)
+                await asyncio.sleep(retry_after + 1)
+                continue
             raise RuntimeError(data.get("description", "Telegram API error"))
-        return data["result"]
+        raise RuntimeError(f"Telegram rate limit did not clear for {method}")
     async def send(self, chat_id: int, text: str, topic_id: int | None = None, markup: dict | None = None):
         body = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if topic_id: body["message_thread_id"] = topic_id
@@ -142,8 +161,10 @@ class BotAPI:
             data = await response.json()
         if not data.get("ok"): raise RuntimeError(data.get("description", "Telegram API error"))
         return data["result"]
-    async def topic(self, chat_id: int, title: str):
-        return await self.call("createForumTopic", chat_id=chat_id, name=title[:128])
+    async def topic(self, chat_id: int, title: str, color: int | None = None):
+        body = {"chat_id": chat_id, "name": title[:128]}
+        if color is not None: body["icon_color"] = color
+        return await self.call("createForumTopic", **body)
 
 
 class Hub:
@@ -160,9 +181,9 @@ class Hub:
         if existing: return existing["topic_id"]
         chat_id = self.store.get("hub_chat_id")
         if not chat_id: raise RuntimeError("CRM group not configured: send /setup in the forum group")
-        project = self.store.db.execute("SELECT name FROM projects WHERE id=?", (account["project_id"],)).fetchone()
+        project = self.store.db.execute("SELECT name, color FROM projects WHERE id=?", (account["project_id"],)).fetchone()
         label = f"{peer_name} · {project['name'] if project else 'Без проекта'}"
-        topic = await self.bot.topic(int(chat_id), label)
+        topic = await self.bot.topic(int(chat_id), label, project["color"] if project else None)
         self.store.add_dialog(account["id"], peer_id, topic["message_thread_id"], peer_name)
         return topic["message_thread_id"]
 
