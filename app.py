@@ -266,6 +266,7 @@ class Hub:
     async def begin_phone_login(self, chat_id: int, user_id: int, project_id: int):
         if user_id in self.pending_auth:
             await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+        self.store.clear_state(user_id)
         session_name, client = self.new_login_client(user_id)
         try:
             await asyncio.wait_for(client.connect(), timeout=45)
@@ -280,6 +281,7 @@ class Hub:
     async def begin_qr_login(self, chat_id: int, user_id: int, project_id: int):
         if user_id in self.pending_auth:
             await self.bot.send(chat_id, "Сначала завершите или отмените текущий вход."); return
+        self.store.clear_state(user_id)
         session_name, client = self.new_login_client(user_id)
         image_path = self.s.db_path.parent / f"qr_{user_id}.png"
         event = asyncio.Event()
