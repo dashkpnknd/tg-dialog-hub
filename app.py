@@ -216,7 +216,10 @@ class Store:
         scripts = self.db.execute("""
           SELECT p.name project_name, o.script_label, COUNT(*) replies
           FROM outreach_messages o JOIN projects p ON p.id=o.project_id
-          WHERE o.replied_at>=? AND o.replied_at<? AND (lower(p.name) LIKE '%тендер%' OR lower(p.name) LIKE '%трейдинг%')
+          WHERE o.replied_at>=? AND o.replied_at<? AND (
+              p.name LIKE '%ТЕНДЕР%' OR p.name LIKE '%тендер%'
+              OR p.name LIKE '%ТРЕЙДИНГ%' OR p.name LIKE '%трейдинг%'
+          )
           GROUP BY p.name, o.script_label HAVING COUNT(*)>0 ORDER BY p.name, replies DESC
         """, (start_ts, end_ts)).fetchall()
         return projects, scripts
