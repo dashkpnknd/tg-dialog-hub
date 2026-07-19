@@ -2,12 +2,14 @@ import asyncio
 import base64
 import datetime as dt
 import html
+import json
 import logging
 import os
 import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -866,6 +868,54 @@ class Hub:
                     text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
             await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
 
+    async def run_requested_historical_script_analysis(self):
+        """One-off analysis requested by an admin; uses live account sessions only."""
+        if self.store.get("historical_script_analysis_requested") != "1": return
+        await asyncio.sleep(15)
+        project_names = ("ГОС ТЕНДЕР", "ТРЕЙДИНГ")
+        output = {}
+        try:
+            for project_name in project_names:
+                project_id = self.store.project_id(project_name)
+                if not project_id: continue
+                totals = Counter()
+                for account in (a for a in self.store.accounts() if a["project_id"] == project_id):
+                    client = self.clients.get(account["session_name"])
+                    if not client: continue
+                    seen_peers = set()
+                    async for dialog in self.folder_dialogs(client, 0, 5000):
+                        chat = dialog.chat
+                        if chat.id in seen_peers or chat.type != ChatType.PRIVATE or getattr(chat, "is_bot", False): continue
+                        seen_peers.add(chat.id)
+                        history = [message async for message in client.get_chat_history(chat.id)]
+                        history.reverse()
+                        first_outbound = next((i for i, message in enumerate(history) if message.outgoing), None)
+                        if first_outbound is None or any(not message.outgoing for message in history[:first_outbound]): continue
+                        label = " ".join((history[first_outbound].text or history[first_outbound].caption or "[медиа/файл]").split())[:500]
+                        totals[("sent", label)] += 1
+                        if any(not message.outgoing for message in history[first_outbound + 1:]): totals[("reply", label)] += 1
+                        await asyncio.sleep(0.8)
+                rows = []
+                for (_, label), sent in totals.items():
+                    replies = totals[("reply", label)]
+                    rows.append({"script": label, "sent": sent, "replies": replies, "rate": round(replies / sent * 100, 2)})
+                output[project_name] = sorted(rows, key=lambda row: (-row["replies"], -row["rate"], -row["sent"]))
+            self.store.set("historical_script_analysis_result", json.dumps(output, ensure_ascii=False))
+            self.store.set("historical_script_analysis_requested", "done")
+            for project_name, rows in output.items():
+                project = self.store.db.execute("SELECT * FROM projects WHERE name=?", (project_name,)).fetchone()
+                if not project: continue
+                total_sent = sum(row["sent"] for row in rows); total_replies = sum(row["replies"] for row in rows)
+                text = f"<b>Исторический анализ скриптов · {html.escape(project_name)}</b>\nТолько основная папка аккаунтов.\n\nОтправлено: <b>{total_sent}</b>\nОтветили: <b>{total_replies}</b>"
+                for row in rows:
+                    text += f"\n• {html.escape(row['script'][:250])} — <b>{row['replies']}</b> из {row['sent']} ({row['rate']}%)"
+                    if len(text) > 3500:
+                        await self.bot.send(self.store.project_hub(project["id"]), text, await self.ensure_report_topic(project)); text = "<b>Продолжение анализа</b>"
+                await self.bot.send(self.store.project_hub(project["id"]), text, await self.ensure_report_topic(project))
+        except Exception:
+            log.exception("Historical script analysis failed")
+            self.store.set("historical_script_analysis_requested", "failed")
+
     async def report_loop(self):
         while True:
             now = dt.datetime.now(REPORT_TZ)
@@ -1018,6 +1068,7 @@ class Hub:
         report_task = asyncio.create_task(self.report_loop())
         watchdog_task = asyncio.create_task(self.poll_watchdog())
         move_task = asyncio.create_task(self.resume_project_moves())
+        historical_analysis_task = asyncio.create_task(self.run_requested_historical_script_analysis())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
@@ -1026,6 +1077,7 @@ class Hub:
             report_task.cancel()
             watchdog_task.cancel()
             move_task.cancel()
+            historical_analysis_task.cancel()
             for client in self.clients.values(): await client.stop()
             await self.bot.close()
 
