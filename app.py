@@ -937,6 +937,29 @@ class Hub:
             log.exception("Historical script analysis failed")
             self.store.set("historical_script_analysis_requested", "failed")
 
+    async def run_requested_dialog_reimport(self):
+        """One-off recovery for a known contact when Telegram discarded its cached peer data."""
+        raw_request = self.store.get("dialog_reimport_request")
+        if not raw_request or raw_request in {"done", "failed"}:
+            return
+        try:
+            request = json.loads(raw_request)
+            await asyncio.sleep(12)
+            account = self.store.account(request["session_name"])
+            client = self.clients.get(request["session_name"])
+            if not account or not client:
+                raise RuntimeError("Account is not available")
+            peer = await client.get_users(request["username"])
+            peer_name = " ".join(filter(None, [peer.first_name, peer.last_name])) or peer.username or str(peer.id)
+            history = [message async for message in client.get_chat_history(peer.id, limit=20)]
+            if not await self.import_dialog(client, account, peer.id, peer_name, history):
+                raise RuntimeError("No client reply was found in the dialog")
+            self.store.set("dialog_reimport_request", "done")
+            log.info("Recovered requested dialog for %s", request["username"])
+        except Exception:
+            log.exception("Requested dialog recovery failed")
+            self.store.set("dialog_reimport_request", "failed")
+
     async def report_loop(self):
         while True:
             now = dt.datetime.now(REPORT_TZ)
@@ -1090,6 +1113,7 @@ class Hub:
         watchdog_task = asyncio.create_task(self.poll_watchdog())
         move_task = asyncio.create_task(self.resume_project_moves())
         historical_analysis_task = asyncio.create_task(self.run_requested_historical_script_analysis())
+        dialog_reimport_task = asyncio.create_task(self.run_requested_dialog_reimport())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
@@ -1099,6 +1123,7 @@ class Hub:
             watchdog_task.cancel()
             move_task.cancel()
             historical_analysis_task.cancel()
+            dialog_reimport_task.cancel()
             for client in self.clients.values(): await client.stop()
             await self.bot.close()
 
