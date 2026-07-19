@@ -344,7 +344,15 @@ class Hub:
         if not account: return
         peer = message.chat
         if peer.id in self.archived_peers.get(client.dialoghub_session, set()):
-            return
+            # A chat can leave Archive after the customer writes again.  The
+            # cached folder state is only a startup snapshot, so verify it on
+            # that rare incoming update instead of silently discarding it.
+            if message.outgoing:
+                return
+            archived_now = await self.load_archived_peer_ids(client)
+            self.archived_peers[client.dialoghub_session] = archived_now
+            if peer.id in archived_now:
+                return
         peer_name = " ".join(filter(None, [peer.first_name, peer.last_name])) or peer.username or str(peer.id)
         try:
             dialog = self.store.dialog(account["id"], peer.id)
