@@ -344,13 +344,15 @@ class Hub:
         if not account: return
         peer = message.chat
         if peer.id in self.archived_peers.get(client.dialoghub_session, set()):
-            # Old archive chats are never imported in bulk.  But a fresh
-            # customer reply means the conversation is active again, even if
-            # Telegram keeps the chat in Archive (for example when it is
-            # muted).  Remember this exception across service restarts.
+            # A chat can leave Archive after the customer writes again.  The
+            # cached folder state is only a startup snapshot, so verify it on
+            # that rare incoming update instead of silently discarding it.
             if message.outgoing:
                 return
-            self.store.set(f"resumed_archive_{account['id']}_{peer.id}", "1")
+            archived_now = await self.load_archived_peer_ids(client)
+            self.archived_peers[client.dialoghub_session] = archived_now
+            if peer.id in archived_now:
+                return
         peer_name = " ".join(filter(None, [peer.first_name, peer.last_name])) or peer.username or str(peer.id)
         try:
             dialog = self.store.dialog(account["id"], peer.id)
@@ -396,7 +398,6 @@ class Hub:
         removed = 0
         for dialog in self.store.dialogs_for_account(account["id"]):
             if dialog["peer_id"] not in archived_ids: continue
-            if self.store.get(f"resumed_archive_{account['id']}_{dialog['peer_id']}") == "1": continue
             try:
                 if dialog["hub_chat_id"]: await self.bot.delete_topic(dialog["hub_chat_id"], dialog["topic_id"])
                 self.store.delete_dialog(account["id"], dialog["peer_id"]); removed += 1
