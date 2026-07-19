@@ -362,7 +362,7 @@ class Hub:
             if not message.outgoing:
                 replied_at = int(message.date.timestamp()) if message.date else int(dt.datetime.now(dt.timezone.utc).timestamp())
                 self.store.mark_reply(account["id"], peer.id, replied_at)
-            if not dialog:
+            if not dialog or not dialog["imported"]:
                 await self.import_dialog(client, account, peer.id, peer_name)
                 return
             topic_id = dialog["topic_id"]
@@ -479,9 +479,22 @@ class Hub:
                 log.exception("Could not import dialog for %s", client.dialoghub_session)
         log.info("Checked %s chats and imported %s replied dialogs for %s", checked, imported, client.dialoghub_session)
 
+    async def import_incomplete_dialogs(self, client: Client, account):
+        """Finish topics whose creation was interrupted by a Telegram rate limit or restart."""
+        for dialog in self.store.dialogs_for_account(account["id"]):
+            if dialog["imported"]:
+                continue
+            try:
+                if await self.import_dialog(client, account, dialog["peer_id"], dialog["peer_name"]):
+                    log.info("Finished interrupted import for %s / %s", client.dialoghub_session, dialog["peer_id"])
+                await asyncio.sleep(2)
+            except Exception:
+                log.exception("Could not finish interrupted dialog import for %s", client.dialoghub_session)
+
     async def import_account_in_background(self, client: Client, account):
         """History import must never hold up the management bot interface."""
         try:
+            await self.import_incomplete_dialogs(client, account)
             await self.import_recent_replied_dialogs(client, account)
         except Exception:
             log.exception("Background history import failed for %s", client.dialoghub_session)
