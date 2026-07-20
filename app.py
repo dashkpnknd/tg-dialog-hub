@@ -108,6 +108,8 @@ class Store:
             self.db.execute("ALTER TABLE dialogs_v2 RENAME TO dialogs")
         if "imported" not in dialog_columns:
             self.db.execute("ALTER TABLE dialogs ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
+        if "needs_reply" not in dialog_columns:
+            self.db.execute("ALTER TABLE dialogs ADD COLUMN needs_reply INTEGER NOT NULL DEFAULT 0")
         default_hub = int(self.get("hub_chat_id") or 0)
         if default_hub:
             self.db.execute("INSERT OR IGNORE INTO hubs(chat_id,title) VALUES(?,?)", (default_hub, "Основная CRM"))
@@ -240,6 +242,13 @@ class Store:
     def mark_imported(self, account_id: int, peer_id: int):
         self.db.execute("UPDATE dialogs SET imported=1 WHERE account_id=? AND peer_id=?", (account_id, peer_id)); self.db.commit()
 
+    def set_needs_reply(self, account_id: int, peer_id: int, value: bool) -> bool:
+        row = self.dialog(account_id, peer_id)
+        was_needed = bool(row and row["needs_reply"])
+        self.db.execute("UPDATE dialogs SET needs_reply=? WHERE account_id=? AND peer_id=?", (int(value), account_id, peer_id))
+        self.db.commit()
+        return was_needed
+
     def state(self, user_id: int):
         return self.db.execute("SELECT * FROM user_states WHERE user_id=?", (user_id,)).fetchone()
 
@@ -305,6 +314,8 @@ class BotAPI:
             return result
     async def delete_topic(self, chat_id: int, topic_id: int):
         return await self.call("deleteForumTopic", chat_id=chat_id, message_thread_id=topic_id)
+    async def edit_topic(self, chat_id: int, topic_id: int, title: str):
+        return await self.call("editForumTopic", chat_id=chat_id, message_thread_id=topic_id, name=title[:128])
 
 
 class Hub:
@@ -316,13 +327,27 @@ class Hub:
         allowed = stored or self.s.admins
         return not allowed or user_id in allowed
 
+    def dialog_title(self, account, peer_name: str, needs_reply: bool = False) -> str:
+        project = self.store.db.execute("SELECT name FROM projects WHERE id=?", (account["project_id"],)).fetchone()
+        marker = "🔴 " if needs_reply else ""
+        return f"{marker}{peer_name} · {project['name'] if project else 'Без проекта'}"
+
+    async def set_dialog_attention(self, account, dialog, needs_reply: bool):
+        was_needed = self.store.set_needs_reply(account["id"], dialog["peer_id"], needs_reply)
+        if was_needed == needs_reply:
+            return
+        try:
+            await self.bot.edit_topic(dialog["hub_chat_id"], dialog["topic_id"], self.dialog_title(account, dialog["peer_name"], needs_reply))
+        except Exception:
+            log.exception("Could not update dialog attention marker")
+
     async def ensure_topic(self, account, peer_id: int, peer_name: str) -> int:
         existing = self.store.dialog(account["id"], peer_id)
         if existing: return existing["topic_id"]
         chat_id = self.store.project_hub(account["project_id"])
         if not chat_id: raise RuntimeError("CRM group not configured: send /setup in the forum group")
         project = self.store.db.execute("SELECT name, color FROM projects WHERE id=?", (account["project_id"],)).fetchone()
-        label = f"{peer_name} · {project['name'] if project else 'Без проекта'}"
+        label = self.dialog_title(account, peer_name)
         topic = await self.bot.topic(int(chat_id), label, project["color"] if project else None)
         self.store.add_dialog(account["id"], peer_id, topic["message_thread_id"], peer_name, chat_id)
         return topic["message_thread_id"]
@@ -367,9 +392,13 @@ class Hub:
                 self.store.mark_reply(account["id"], peer.id, replied_at)
             if not dialog or not dialog["imported"]:
                 await self.import_dialog(client, account, peer.id, peer_name)
+                dialog = self.store.dialog(account["id"], peer.id)
+                if dialog and not message.outgoing:
+                    await self.set_dialog_attention(account, dialog, True)
                 return
             topic_id = dialog["topic_id"]
             await self.copy_message(account, peer.id, topic_id, message)
+            await self.set_dialog_attention(account, dialog, not message.outgoing)
         except Exception:
             log.exception("Could not route message")
 
@@ -1039,6 +1068,9 @@ class Hub:
         if not client: return
         try:
             await client.send_message(dialog["peer_id"], text)
+            account = self.store.account(dialog["session_name"])
+            if account:
+                await self.set_dialog_attention(account, dialog, False)
         except Exception:
             log.exception("Could not send reply")
             await self.bot.send(crm_chat_id, "⚠️ Не удалось отправить ответ с рабочего аккаунта.", topic_id)
