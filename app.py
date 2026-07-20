@@ -497,6 +497,10 @@ class Hub:
         async for dialog in self.folder_dialogs(client, 0, 250):
             if imported >= 50: break
             chat = dialog.chat
+            # Telegram may return a pinned archived dialog in the main list as
+            # well.  The explicit archive snapshot is the source of truth.
+            if chat.id in self.archived_peers.get(client.dialoghub_session, set()):
+                continue
             existing = self.store.dialog(account["id"], chat.id)
             if chat.type != ChatType.PRIVATE or (existing and existing["imported"]):
                 continue
