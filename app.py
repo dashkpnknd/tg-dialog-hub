@@ -997,6 +997,38 @@ class Hub:
             log.exception("Requested dialog recovery failed")
             self.store.set("dialog_reimport_request", "failed")
 
+    async def run_requested_attention_backfill(self):
+        """One-time, resumable scan that marks every dialog awaiting a reply."""
+        if self.store.get("attention_backfill") != "1":
+            return
+        await asyncio.sleep(20)
+        progress = int(self.store.get("attention_backfill_progress") or 0)
+        dialogs = []
+        for account in self.store.accounts():
+            for dialog in self.store.dialogs_for_account(account["id"]):
+                dialogs.append((account, dialog))
+        try:
+            for index, (account, dialog) in enumerate(dialogs):
+                if index < progress:
+                    continue
+                client = self.clients.get(account["session_name"])
+                if not client:
+                    continue
+                try:
+                    latest = [message async for message in client.get_chat_history(dialog["peer_id"], limit=1)]
+                    if latest:
+                        await self.set_dialog_attention(account, dialog, not latest[0].outgoing)
+                except Exception:
+                    log.exception("Could not check reply status for %s / %s", account["session_name"], dialog["peer_id"])
+                self.store.set("attention_backfill_progress", str(index + 1))
+                if (index + 1) % 25 == 0:
+                    log.info("Attention scan: %s of %s dialogs", index + 1, len(dialogs))
+                await asyncio.sleep(1.2)
+            self.store.set("attention_backfill", "done")
+            log.info("Attention scan completed: %s dialogs", len(dialogs))
+        except Exception:
+            log.exception("Attention scan failed")
+
     async def report_loop(self):
         while True:
             now = dt.datetime.now(REPORT_TZ)
@@ -1154,6 +1186,7 @@ class Hub:
         move_task = asyncio.create_task(self.resume_project_moves())
         historical_analysis_task = asyncio.create_task(self.run_requested_historical_script_analysis())
         dialog_reimport_task = asyncio.create_task(self.run_requested_dialog_reimport())
+        attention_backfill_task = asyncio.create_task(self.run_requested_attention_backfill())
         asyncio.create_task(self.ensure_all_report_topics())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
@@ -1164,6 +1197,7 @@ class Hub:
             move_task.cancel()
             historical_analysis_task.cancel()
             dialog_reimport_task.cancel()
+            attention_backfill_task.cancel()
             for client in self.clients.values(): await client.stop()
             await self.bot.close()
 
