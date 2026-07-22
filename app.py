@@ -908,8 +908,8 @@ class Hub:
             except Exception: log.exception("Could not create report topic for %s", project["name"])
 
     async def send_daily_report(self, report_day: dt.date):
-        start = dt.datetime.combine(report_day, dt.time.min, tzinfo=REPORT_TZ)
-        end = start + dt.timedelta(days=1)
+        start = dt.datetime.fromtimestamp(0, tz=REPORT_TZ)
+        end = dt.datetime.combine(report_day + dt.timedelta(days=1), dt.time.min, tzinfo=REPORT_TZ)
         projects, scripts = self.store.daily_stats(int(start.timestamp()), int(end.timestamp()))
         project_rows = {row["name"]: row for row in projects}
         scripts_by_project = {}
@@ -918,13 +918,26 @@ class Hub:
             topic_id = await self.ensure_report_topic(project)
             if not topic_id: continue
             row = project_rows.get(project["name"]); sent = row["sent"] if row else 0; replied = row["replied"] if row else 0
-            text = f"<b>Отчёт · {html.escape(project['name'])}</b>\n{report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
+            text = f"<b>Статистика · {html.escape(project['name'])}</b>\nЗа всё время работы аккаунтов по {report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
             project_scripts = scripts_by_project.get(project["name"], [])
             if project_scripts:
                 text += "\n\n<b>Сработавшие скрипты</b>"
-                for script in project_scripts:
+                for script in project_scripts[:20]:
                     text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
-            await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
+                if len(project_scripts) > 20: text += f"\n… ещё {len(project_scripts) - 20}"
+            key = f"rolling_report_message_{project['id']}"
+            message_id = self.store.get(key)
+            try:
+                if message_id:
+                    await self.bot.edit(self.store.project_hub(project["id"]), int(message_id), text)
+                else:
+                    message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
+                    self.store.set(key, str(message["message_id"]))
+            except Exception:
+                log.exception("Could not update report message for %s", project["name"])
+                self.store.set(key, "")
+                message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
+                self.store.set(key, str(message["message_id"]))
 
     async def run_requested_historical_script_analysis(self):
         """One-off analysis requested by an admin; uses live account sessions only."""
