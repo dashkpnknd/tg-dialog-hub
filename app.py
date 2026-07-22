@@ -908,9 +908,10 @@ class Hub:
             except Exception: log.exception("Could not create report topic for %s", project["name"])
 
     async def send_daily_report(self, report_day: dt.date):
-        start = dt.datetime.fromtimestamp(0, tz=REPORT_TZ)
-        end = dt.datetime.combine(report_day + dt.timedelta(days=1), dt.time.min, tzinfo=REPORT_TZ)
-        projects, scripts = self.store.daily_stats(int(start.timestamp()), int(end.timestamp()))
+        start = dt.datetime.combine(report_day, dt.time.min, tzinfo=REPORT_TZ)
+        end = start + dt.timedelta(days=1)
+        projects, _ = self.store.daily_stats(int(start.timestamp()), int(end.timestamp()))
+        _, scripts = self.store.daily_stats(0, int(end.timestamp()))
         project_rows = {row["name"]: row for row in projects}
         scripts_by_project = {}
         for row in scripts: scripts_by_project.setdefault(row["project_name"], []).append(row)
@@ -918,7 +919,7 @@ class Hub:
             topic_id = await self.ensure_report_topic(project)
             if not topic_id: continue
             row = project_rows.get(project["name"]); sent = row["sent"] if row else 0; replied = row["replied"] if row else 0
-            text = f"<b>Статистика · {html.escape(project['name'])}</b>\nЗа всё время работы аккаунтов по {report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
+            text = f"<b>Отчёт · {html.escape(project['name'])}</b>\n{report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
             project_scripts = scripts_by_project.get(project["name"], [])
             if project_scripts:
                 text += "\n\n<b>Сработавшие скрипты</b>"
