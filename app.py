@@ -197,7 +197,8 @@ class Store:
 
     def track_outreach(self, account, peer_id: int, message):
         text = (message.text or message.caption or "[медиа/файл]").strip()
-        label = " ".join(text.split())[:160] or "[медиа/файл]"
+        # Script analytics needs the actual message, not a shortened preview.
+        label = " ".join(text.split()) or "[медиа/файл]"
         sent_at = int(message.date.timestamp()) if message.date else int(dt.datetime.now(dt.timezone.utc).timestamp())
         self.db.execute("INSERT OR IGNORE INTO outreach_messages(account_id,peer_id,source_message_id,project_id,script_label,sent_at) VALUES(?,?,?,?,?,?)", (account["id"], peer_id, message.id, account["project_id"], label, sent_at)); self.db.commit()
 
