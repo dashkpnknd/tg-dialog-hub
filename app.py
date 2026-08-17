@@ -338,7 +338,18 @@ class Hub:
         # A copied incoming message already creates Telegram's native unread
         # badge on its forum topic.  Do not rename the topic for this: edited
         # titles hide the contact name and do not create a reliable notification.
-        self.store.set_needs_reply(account["id"], dialog["peer_id"], needs_reply)
+        was_needed = self.store.set_needs_reply(account["id"], dialog["peer_id"], needs_reply)
+        if needs_reply or not was_needed:
+            return
+        # Only clean up a title that was marked by the legacy implementation.
+        # This never adds a red marker and runs once, after the operator replies.
+        try:
+            await self.bot.edit_topic(
+                dialog["hub_chat_id"], dialog["topic_id"],
+                self.dialog_title(account, dialog["peer_name"]),
+            )
+        except Exception:
+            log.exception("Could not clear legacy dialog attention marker")
 
     async def restore_dialog_titles(self):
         """Remove the legacy attention prefix from topics once, after upgrade."""
