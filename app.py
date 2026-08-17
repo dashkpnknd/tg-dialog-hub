@@ -335,13 +335,28 @@ class Hub:
         return f"{marker}{peer_name} · {project['name'] if project else 'Без проекта'}"
 
     async def set_dialog_attention(self, account, dialog, needs_reply: bool):
-        was_needed = self.store.set_needs_reply(account["id"], dialog["peer_id"], needs_reply)
-        if was_needed == needs_reply:
-            return
-        try:
-            await self.bot.edit_topic(dialog["hub_chat_id"], dialog["topic_id"], self.dialog_title(account, dialog["peer_name"], needs_reply))
-        except Exception:
-            log.exception("Could not update dialog attention marker")
+        # A copied incoming message already creates Telegram's native unread
+        # badge on its forum topic.  Do not rename the topic for this: edited
+        # titles hide the contact name and do not create a reliable notification.
+        self.store.set_needs_reply(account["id"], dialog["peer_id"], needs_reply)
+
+    async def restore_dialog_titles(self):
+        """Remove the legacy attention prefix from topics once, after upgrade."""
+        rows = self.store.db.execute("""
+            SELECT d.*, a.session_name, a.project_id
+            FROM dialogs d JOIN accounts a ON a.id=d.account_id
+            WHERE d.needs_reply=1
+        """).fetchall()
+        for dialog in rows:
+            try:
+                await self.bot.edit_topic(
+                    dialog["hub_chat_id"], dialog["topic_id"],
+                    self.dialog_title(dialog, dialog["peer_name"]),
+                )
+                self.store.set_needs_reply(dialog["account_id"], dialog["peer_id"], False)
+                await asyncio.sleep(0.15)
+            except Exception:
+                log.exception("Could not restore dialog title for topic %s", dialog["topic_id"])
 
     async def ensure_topic(self, account, peer_id: int, peer_name: str) -> int:
         existing = self.store.dialog(account["id"], peer_id)
@@ -927,19 +942,9 @@ class Hub:
                 for script in project_scripts[:20]:
                     text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
                 if len(project_scripts) > 20: text += f"\n… ещё {len(project_scripts) - 20}"
-            key = f"rolling_report_message_{project['id']}"
-            message_id = self.store.get(key)
-            try:
-                if message_id:
-                    await self.bot.edit(self.store.project_hub(project["id"]), int(message_id), text)
-                else:
-                    message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
-                    self.store.set(key, str(message["message_id"]))
-            except Exception:
-                log.exception("Could not update report message for %s", project["name"])
-                self.store.set(key, "")
-                message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
-                self.store.set(key, str(message["message_id"]))
+            # Send a new message every day.  Editing one rolling message hides
+            # the update in Telegram and makes the daily report appear stalled.
+            await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
 
     async def run_requested_historical_script_analysis(self):
         """One-off analysis requested by an admin; uses live account sessions only."""
@@ -1203,6 +1208,7 @@ class Hub:
         dialog_reimport_task = asyncio.create_task(self.run_requested_dialog_reimport())
         attention_backfill_task = asyncio.create_task(self.run_requested_attention_backfill())
         asyncio.create_task(self.ensure_all_report_topics())
+        asyncio.create_task(self.restore_dialog_titles())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
         try: await self.poll()
