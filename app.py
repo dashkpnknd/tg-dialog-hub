@@ -355,6 +355,14 @@ class Hub:
                 )
                 self.store.set_needs_reply(dialog["account_id"], dialog["peer_id"], False)
                 await asyncio.sleep(0.15)
+            except RuntimeError as exc:
+                if "TOPIC_ID_INVALID" in str(exc):
+                    # The topic was deleted outside Dialog Hub.  Do not retry
+                    # it after every restart.
+                    self.store.set_needs_reply(dialog["account_id"], dialog["peer_id"], False)
+                    log.info("Skipping deleted topic %s during title restore", dialog["topic_id"])
+                    continue
+                log.exception("Could not restore dialog title for topic %s", dialog["topic_id"])
             except Exception:
                 log.exception("Could not restore dialog title for topic %s", dialog["topic_id"])
 
@@ -618,7 +626,17 @@ class Hub:
             session_path.unlink(missing_ok=True); (self.s.sessions_dir / f"{session_name}.session-journal").unlink(missing_ok=True)
             await self.cleanup_stale_account(account, "session is not authorized")
             return
-        self.archived_peers[session_name] = await self.load_archived_peer_ids(client)
+        try:
+            self.archived_peers[session_name] = await self.load_archived_peer_ids(client)
+        except Exception as exc:
+            # A session can pass connect() but still have been revoked by
+            # Telegram.  Remove it cleanly instead of leaving a dead account.
+            try:
+                await client.disconnect()
+            except Exception:
+                log.exception("Could not disconnect invalid session %s", session_name)
+            await self.cleanup_stale_account(account, f"session is invalid: {type(exc).__name__}")
+            return
         await self.remove_archived_topics(client, account)
         client.add_handler(MessageHandler(self.routed_message, filters.private & (filters.incoming | filters.outgoing)))
         await client.initialize(); self.clients[session_name] = client
