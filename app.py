@@ -1226,7 +1226,6 @@ class Hub:
         dialog_reimport_task = asyncio.create_task(self.run_requested_dialog_reimport())
         attention_backfill_task = asyncio.create_task(self.run_requested_attention_backfill())
         asyncio.create_task(self.ensure_all_report_topics())
-        asyncio.create_task(self.restore_dialog_titles())
         for account in self.store.accounts():
             asyncio.create_task(self.start_account(account["session_name"]))
         try: await self.poll()
