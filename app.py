@@ -984,9 +984,10 @@ class Hub:
             # the update in Telegram and makes the daily report appear stalled.
             message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
             self.store.add_report_message(report_day, project["id"], "daily", self.store.project_hub(project["id"]), message["message_id"])
-            for page in self.script_report_pages(project, report_day):
-                message = await self.bot.send(self.store.project_hub(project["id"]), page, topic_id)
-                self.store.add_report_message(report_day, project["id"], "scripts", self.store.project_hub(project["id"]), message["message_id"])
+            if project["name"] in {"ГОСЗАКУПКИ", "ТРЕЙДИНГ"}:
+                for page in self.script_report_pages(project, report_day):
+                    message = await self.bot.send(self.store.project_hub(project["id"]), page, topic_id)
+                    self.store.add_report_message(report_day, project["id"], "scripts", self.store.project_hub(project["id"]), message["message_id"])
 
     def script_report_pages(self, project, report_day: dt.date) -> list[str]:
         """Use the same categories and visual format as Project Analytics."""
@@ -1014,7 +1015,8 @@ class Hub:
             if group:
                 blocks.append(title); blocks.extend(show(i, item) for i, item in enumerate(group, 1))
         if zero:
-            blocks.append(f"⚪ <b>Без ответов</b>\n{len(zero)} скриптов с 0 ответов на {sum(x['sent'] for x in zero)} отправок. Их тексты не выводятся, чтобы не засорять отчёт.")
+            blocks.append(f"⚪ <b>Без ответов</b>\n{len(zero)} скриптов с 0 ответов на {sum(x['sent'] for x in zero)} отправок.")
+            blocks.extend(show(i, item) for i, item in enumerate(sorted(zero, key=lambda x: x["sent"], reverse=True), 1))
         pages, current = [], ""
         for block in blocks:
             candidate = f"{current}\n\n{block}" if current else block
