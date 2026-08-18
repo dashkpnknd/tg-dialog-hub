@@ -990,9 +990,9 @@ class Hub:
                     self.store.add_report_message(report_day, project["id"], "scripts", self.store.project_hub(project["id"]), message["message_id"])
 
     def script_report_pages(self, project, report_day: dt.date) -> list[str]:
-        """Use the same categories and visual format as Project Analytics."""
-        end = dt.datetime.combine(report_day + dt.timedelta(days=1), dt.time.min, tzinfo=REPORT_TZ)
-        start = end - dt.timedelta(days=2)
+        """Use the same categories and visual format for one report day."""
+        start = dt.datetime.combine(report_day, dt.time.min, tzinfo=REPORT_TZ)
+        end = start + dt.timedelta(days=1)
         rows = [row for row in self.store.script_metrics(project["id"], int(start.timestamp()), int(end.timestamp())) if row["script_label"] != "[медиа/файл]"]
         if not rows:
             return []
@@ -1009,7 +1009,7 @@ class Hub:
         def show(index, item):
             text = html.escape(" ".join(item["text"].split()))
             return f"<b>{index}. {item['replied']}/{item['sent']} ответов — {item['rate'] * 100:.1f}%</b>\n<blockquote>{text}</blockquote>"
-        blocks = [f"<b>Скрипты · {html.escape(project['name'])}</b>\nАктуальные: отправлялись за последние 2 дня\nВсего по текстовым скриптам: <b>{total_replied}/{total_sent}</b> ответов · <b>{average * 100:.1f}%</b>"]
+        blocks = [f"<b>Скрипты · {html.escape(project['name'])}</b>\nЗа {report_day.strftime('%d.%m.%Y')} · только отправки этого дня\nВсего по текстовым скриптам: <b>{total_replied}/{total_sent}</b> ответов · <b>{average * 100:.1f}%</b>"]
         sections = [(f"🏆 <b>Топовые скрипты</b>\nВыборка от 20 отправок; конверсия от {top_threshold * 100:.1f}% — минимум на 25% выше средней.", top), ("✅ <b>Рабочие скрипты</b>\nВыборка от 20 отправок; конверсия на уровне или выше средней.", working), ("📉 <b>Нужна доработка</b>\nВыборка от 20 отправок, но конверсия ниже средней.", weak), (f"🧪 <b>Ещё тестируем</b>\n{len(tests)} скриптов с ответами, но выборка меньше 20 отправок — выводы делать рано.", tests)]
         for title, group in sections:
             if group:
