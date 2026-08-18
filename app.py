@@ -87,6 +87,10 @@ class Store:
         CREATE TABLE IF NOT EXISTS report_topics (
           project_id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
           FOREIGN KEY(project_id) REFERENCES projects(id));
+        CREATE TABLE IF NOT EXISTS report_messages (
+          report_day TEXT NOT NULL, project_id INTEGER NOT NULL, kind TEXT NOT NULL,
+          chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+          PRIMARY KEY(report_day, project_id, kind, message_id));
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
         if "color" not in columns:
@@ -227,6 +231,20 @@ class Store:
           GROUP BY p.name, o.script_label HAVING COUNT(*)>0 ORDER BY p.name, replies DESC
         """, (start_ts, end_ts)).fetchall()
         return projects, scripts
+
+    def script_metrics(self, project_id: int, start_ts: int, end_ts: int):
+        """Per-script conversion for the current two-day outreach cohort."""
+        return self.db.execute("""
+          SELECT o.script_label, COUNT(*) sent,
+                 SUM(CASE WHEN o.replied_at>=? AND o.replied_at<? THEN 1 ELSE 0 END) replied
+          FROM outreach_messages o
+          WHERE o.project_id=? AND o.sent_at>=? AND o.sent_at<?
+          GROUP BY o.script_label ORDER BY sent DESC, replied DESC, o.script_label
+        """, (start_ts, end_ts, project_id, start_ts, end_ts)).fetchall()
+
+    def add_report_message(self, report_day: dt.date, project_id: int, kind: str, chat_id: int, message_id: int):
+        self.db.execute("INSERT OR IGNORE INTO report_messages(report_day,project_id,kind,chat_id,message_id) VALUES(?,?,?,?,?)", (report_day.isoformat(), project_id, kind, chat_id, message_id))
+        self.db.commit()
 
     def report_topic(self, project_id: int):
         row = self.db.execute("SELECT topic_id FROM report_topics WHERE project_id=?", (project_id,)).fetchone()
@@ -956,24 +974,56 @@ class Hub:
         start = dt.datetime.combine(report_day, dt.time.min, tzinfo=REPORT_TZ)
         end = start + dt.timedelta(days=1)
         projects, _ = self.store.daily_stats(int(start.timestamp()), int(end.timestamp()))
-        _, scripts = self.store.daily_stats(0, int(end.timestamp()))
         project_rows = {row["name"]: row for row in projects}
-        scripts_by_project = {}
-        for row in scripts: scripts_by_project.setdefault(row["project_name"], []).append(row)
         for project in self.store.projects():
             topic_id = await self.ensure_report_topic(project)
             if not topic_id: continue
             row = project_rows.get(project["name"]); sent = row["sent"] if row else 0; replied = row["replied"] if row else 0
             text = f"<b>Отчёт · {html.escape(project['name'])}</b>\n{report_day.strftime('%d.%m.%Y')}\n\nОтправлено: <b>{sent}</b>\nОтветили: <b>{replied}</b>"
-            project_scripts = scripts_by_project.get(project["name"], [])
-            if project_scripts:
-                text += "\n\n<b>Сработавшие скрипты</b>"
-                for script in project_scripts[:20]:
-                    text += f"\n• {html.escape(script['script_label'])} — <b>{script['replies']}</b>"
-                if len(project_scripts) > 20: text += f"\n… ещё {len(project_scripts) - 20}"
             # Send a new message every day.  Editing one rolling message hides
             # the update in Telegram and makes the daily report appear stalled.
-            await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
+            message = await self.bot.send(self.store.project_hub(project["id"]), text, topic_id)
+            self.store.add_report_message(report_day, project["id"], "daily", self.store.project_hub(project["id"]), message["message_id"])
+            for page in self.script_report_pages(project, report_day):
+                message = await self.bot.send(self.store.project_hub(project["id"]), page, topic_id)
+                self.store.add_report_message(report_day, project["id"], "scripts", self.store.project_hub(project["id"]), message["message_id"])
+
+    def script_report_pages(self, project, report_day: dt.date) -> list[str]:
+        """Use the same categories and visual format as Project Analytics."""
+        end = dt.datetime.combine(report_day + dt.timedelta(days=1), dt.time.min, tzinfo=REPORT_TZ)
+        start = end - dt.timedelta(days=2)
+        rows = [row for row in self.store.script_metrics(project["id"], int(start.timestamp()), int(end.timestamp())) if row["script_label"] != "[медиа/файл]"]
+        if not rows:
+            return []
+        items = [{"text": row["script_label"], "sent": row["sent"], "replied": row["replied"], "rate": row["replied"] / row["sent"] if row["sent"] else 0} for row in rows]
+        total_sent, total_replied = sum(x["sent"] for x in items), sum(x["replied"] for x in items)
+        average = total_replied / total_sent if total_sent else 0
+        reliable = [x for x in items if x["sent"] >= 20]
+        top_threshold = max(average * 1.25, average + 0.05)
+        top = sorted([x for x in reliable if x["rate"] >= top_threshold], key=lambda x: (x["rate"], x["sent"]), reverse=True)
+        working = sorted([x for x in reliable if average <= x["rate"] < top_threshold], key=lambda x: (x["rate"], x["sent"]), reverse=True)
+        weak = sorted([x for x in reliable if x["rate"] < average and x["replied"] > 0], key=lambda x: (x["rate"], -x["sent"]))
+        tests = sorted([x for x in items if x["sent"] < 20 and x["replied"] > 0], key=lambda x: (x["rate"], x["sent"]), reverse=True)
+        zero = [x for x in items if not x["replied"]]
+        def show(index, item):
+            text = html.escape(" ".join(item["text"].split()))
+            return f"<b>{index}. {item['replied']}/{item['sent']} ответов — {item['rate'] * 100:.1f}%</b>\n<blockquote>{text}</blockquote>"
+        blocks = [f"<b>Скрипты · {html.escape(project['name'])}</b>\nАктуальные: отправлялись за последние 2 дня\nВсего по текстовым скриптам: <b>{total_replied}/{total_sent}</b> ответов · <b>{average * 100:.1f}%</b>"]
+        sections = [(f"🏆 <b>Топовые скрипты</b>\nВыборка от 20 отправок; конверсия от {top_threshold * 100:.1f}% — минимум на 25% выше средней.", top), ("✅ <b>Рабочие скрипты</b>\nВыборка от 20 отправок; конверсия на уровне или выше средней.", working), ("📉 <b>Нужна доработка</b>\nВыборка от 20 отправок, но конверсия ниже средней.", weak), (f"🧪 <b>Ещё тестируем</b>\n{len(tests)} скриптов с ответами, но выборка меньше 20 отправок — выводы делать рано.", tests)]
+        for title, group in sections:
+            if group:
+                blocks.append(title); blocks.extend(show(i, item) for i, item in enumerate(group, 1))
+        if zero:
+            blocks.append(f"⚪ <b>Без ответов</b>\n{len(zero)} скриптов с 0 ответов на {sum(x['sent'] for x in zero)} отправок. Их тексты не выводятся, чтобы не засорять отчёт.")
+        pages, current = [], ""
+        for block in blocks:
+            candidate = f"{current}\n\n{block}" if current else block
+            if current and len(candidate) > 3500:
+                pages.append(current); current = block
+            else:
+                current = candidate
+        if current: pages.append(current)
+        return pages
 
     async def run_requested_historical_script_analysis(self):
         """One-off analysis requested by an admin; uses live account sessions only."""
